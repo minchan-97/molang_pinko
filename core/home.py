@@ -1,0 +1,481 @@
+"""
+home.py — 몰랑이와 피우피우가 사는 집.
+
+왜 집인가
+  둘은 감각이 거의 없다. 검색 결과와 대화가 입력의 전부다.
+  카메라로 바깥을 보는 건 아직 못 하지만, **자기들만의 공간**은 가질 수 있다.
+  그리고 공간이 있으면 세 가지가 생긴다.
+
+    1) 관심의 방향   있는 곳이 궁금한 것을 바꾼다 (부엌에 오래 있으면 재료가 궁금해진다)
+    2) 기억의 자리   '어디서 있었던 일'인지가 남는다
+    3) 대화의 계기   같은 방에 있으면 말이 더 오간다 (다른 방이어도 대화는 된다)
+
+  순서가 중요하다. 이 집은 돌아다니기 위한 무대가 아니라,
+  **관심이 자라는 밭**이다.
+
+어떻게 두나
+  방마다 '결'이 있다 (낱말 몇 개). 그 낱말을 벡터로 만들어 방의 좌표로 쓴다.
+  누군가의 관심 벡터가 방의 좌표와 가까우면 그 방에 끌린다.
+  머물면 그 방의 결이 관심에 조금씩 스민다 — 그게 이 집의 핵심이다.
+
+자율
+  닫힌 공간이라 위험이 없다. 그래서 스스로 하게 둔다.
+    · 물건을 옮기거나 새로 만든다 (요즘 관심에서 이름을 얻는다)
+    · 자주 가는 방이 생기고, 안 가는 방은 먼지가 앉는다
+  무엇을 만들어두고 어디에 오래 있었는지가 성격의 기록이 된다.
+"""
+from __future__ import annotations
+import math
+import random
+import time
+
+import numpy as np
+
+DIM = 64
+DWELL_WEIGHT = 0.05      # 머문 방의 결이 관심에 스미는 정도
+MOVE_TEMP = 0.8          # 낮으면 늘 같은 방, 높으면 아무 데나
+BUILD_CHANCE = 0.25      # 회차마다 뭔가 만들거나 옮길 확률
+
+# 몸 — 크기는 '갈 수 있느냐'가 아니라 '어떻게 느끼느냐'다.
+# 자기 집에 못 들어가는 방은 없다. 다만 큰 몸은 좁은 데서 조심스럽고,
+# 작은 몸은 넓은 데서 두리번거린다. 그 차이가 관심을 다르게 만든다.
+BODY = {
+    "molang": {"size": 1.0, "name": "대왕토끼"},   # 크다
+    "piupiu": {"size": 0.25, "name": "병아리"},    # 아주 작다
+}
+
+# 방마다 결만 있는 게 아니라 **자극**이 있다. 밝고 시끄러운 방과
+# 어둑하고 조용한 방에서 같은 생각이 나올 리 없다.
+ROOM_STIM = {
+    "부엌":   {"밝기": 0.6, "소리": 0.6, "온도": 0.8, "냄새": 0.9},
+    "서재":   {"밝기": 0.5, "소리": 0.1, "온도": 0.5, "냄새": 0.3},
+    "창가":   {"밝기": 0.9, "소리": 0.3, "온도": 0.6, "냄새": 0.4},
+    "작업방": {"밝기": 0.7, "소리": 0.7, "온도": 0.5, "냄새": 0.5},
+    "마당":   {"밝기": 1.0, "소리": 0.5, "온도": 0.4, "냄새": 0.7},
+    "다락":   {"밝기": 0.2, "소리": 0.1, "온도": 0.3, "냄새": 0.6},
+}
+
+
+def stim(room: str) -> dict:
+    s = ROOM_STIM.get(room, {})
+    lift = (s.get("밝기", .5) * .45 + s.get("온도", .5) * .3
+            + s.get("냄새", .5) * .25)
+    return {**s, "lift": round(lift, 2),
+            "note": ("환하다" if s.get("밝기", 0) > 0.8 else
+                     "어둑하다" if s.get("밝기", 1) < 0.3 else ""),
+            "quiet": s.get("소리", 0.5) < 0.2}
+
+
+# 방의 품 — 넓은 방일수록 크다
+ROOM_SPACE = {"부엌": 0.7, "서재": 0.6, "창가": 0.5,
+              "작업방": 0.6, "마당": 1.0, "다락": 0.35}
+
+
+def fit(who: str, room: str) -> dict:
+    """
+    몸과 방이 어떻게 만나나. 막지 않고 느낌만 다르게 한다.
+      좁다  큰 몸이 작은 방에 — 조심스럽고, 오래 안 머문다. 대신 구석이 잘 보인다
+      넓다  작은 몸이 큰 방에 — 두리번거리고, 새로 눈에 띄는 게 많다
+    """
+    size = BODY.get(who, {}).get("size", 0.5)
+    space = ROOM_SPACE.get(room, 0.6)
+    ratio = size / max(0.05, space)
+    if ratio > 1.6:
+        return {"feel": "좁다", "stay": 0.7, "notice": 1.4,
+                "note": "몸이 꽉 차서 구석까지 눈에 들어온다"}
+    if ratio < 0.5:
+        return {"feel": "넓다", "stay": 1.2, "notice": 1.3,
+                "note": "넓어서 두리번거리게 된다"}
+    return {"feel": "맞다", "stay": 1.0, "notice": 1.0, "note": ""}
+
+
+ROOMS = {
+    "부엌": ["재료", "굽기", "발효", "맛", "냄비", "빵"],
+    "서재": ["책", "기록", "역사", "언어", "지도", "수학"],
+    "창가": ["하늘", "날씨", "구름", "바다", "빛", "계절"],
+    "작업방": ["만들기", "도구", "종이", "색", "기계", "고치기"],
+    "마당": ["흙", "씨앗", "벌레", "새", "나무", "바람"],
+    "다락": ["오래된", "상자", "추억", "먼지", "사진", "편지"],
+}
+
+
+def _vec(text: str):
+    from organism.embedder import hashed_embedding
+    return hashed_embedding(text or "", dim=DIM)
+
+
+def room_vectors() -> dict:
+    return {name: _vec(" ".join(words)) for name, words in ROOMS.items()}
+
+
+# ── 좌표계 ───────────────────────────────────────────────────
+# 방 이름만 있으면 '창가 → 마당'과 '창가 → 다락'이 똑같다. 그건 공간이 아니라
+# 상태 여섯 개다. SOM 격자에 방을 얹으면 **결이 비슷한 방이 가까이** 놓이고,
+# 그때부터 이동에 거리가 생긴다. 먼 방은 뜸해지고, 가까운 방끼리 길이 난다.
+_LAYOUT = {"coords": None, "dist": None}
+
+
+def layout(seed: int = 7) -> dict:
+    """방을 격자 위에 배치하고 방 사이 거리를 낸다 (한 번 계산해 재사용)."""
+    if _LAYOUT["coords"] is not None:
+        return _LAYOUT
+    try:
+        from organism.som import SOM
+        names = list(ROOMS)
+        X = np.array([_vec(" ".join(ROOMS[n])) for n in names])
+        som = SOM(grid=(5, 5), dim=DIM, seed=seed)
+        som.train(X, iters=1500, seed=seed)
+        pos = {}
+        used = set()
+        for n, x in zip(names, X):
+            b = som.bmu_of(x)
+            while b in used:                 # 한 칸에 두 방이 겹치지 않게
+                b = (b + 1) % (som.gh * som.gw)
+            used.add(b)
+            pos[n] = (b // som.gw, b % som.gw)
+        dist = {a: {b: float(abs(pos[a][0] - pos[b][0]) + abs(pos[a][1] - pos[b][1]))
+                    for b in names} for a in names}
+        _LAYOUT.update(coords=pos, dist=dist)
+    except Exception:                        # 실패하면 거리를 모두 1로 (예전 동작)
+        names = list(ROOMS)
+        _LAYOUT.update(
+            coords={n: (0, i) for i, n in enumerate(names)},
+            dist={a: {b: (0.0 if a == b else 1.0) for b in names} for a in names})
+    return _LAYOUT
+
+
+def distance(a: str, b: str) -> float:
+    return layout()["dist"].get(a, {}).get(b, 1.0)
+
+
+def airport_from(room: str = None) -> dict:
+    """
+    공항은 집 격자 **바깥**, 가장 먼 자리에 있다.
+    집에서 가장 먼 방을 지나 거기서 더 가야 한다 — 그래서 '떠난다'가 된다.
+    """
+    L = layout()
+    names = list(ROOMS)
+    far_room, far = names[0], -1.0
+    base = room or "창가"
+    for n in names:
+        d = L["dist"].get(base, {}).get(n, 0.0)
+        if d > far:
+            far_room, far = n, d
+    return {"through": far_room, "home_dist": far,
+            "extra": 12.0,          # 집 격자를 벗어나는 거리
+            "total": round(far + 12.0, 1)}
+
+
+def interest_vector(interests: dict, top=8):
+    """지금 관심을 하나의 방향으로."""
+    items = sorted((interests or {}).items(), key=lambda kv: -kv[1])[:top]
+    if not items:
+        return np.zeros(DIM)
+    v = np.zeros(DIM)
+    for t, w in items:
+        v += _vec(t) * float(w)
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-9 else v
+
+
+# ── 집 상태 ──────────────────────────────────────────────────
+def blank() -> dict:
+    return {"where": {"molang": "창가", "piupiu": "부엌"},
+            "objects": {r: [] for r in ROOMS},
+            "visits": {r: 0 for r in ROOMS},
+            "log": []}
+
+
+def load(sb) -> dict:
+    try:
+        rows = (sb.table("molang_home").select("layout")
+                .eq("id", 1).limit(1).execute().data) or []
+        if rows and rows[0].get("layout"):
+            h = rows[0]["layout"]
+            for k, v in blank().items():
+                h.setdefault(k, v)
+            return h
+    except Exception:
+        pass
+    return blank()
+
+
+def save(sb, home: dict):
+    try:
+        home["log"] = (home.get("log") or [])[-60:]
+        sb.table("molang_home").upsert(
+            {"id": 1, "layout": home}, on_conflict="id").execute()
+        return True
+    except Exception:
+        return False
+
+
+# ── 움직임 ───────────────────────────────────────────────────
+def move(home: dict, who: str, interests: dict, rng=None) -> str:
+    """
+    어디로 갈까. 관심과 가까운 방에 끌리되, 늘 같은 방만 가지 않게
+    최근에 많이 간 방은 조금 식힌다(새로움).
+    """
+    rng = rng or random.Random(time.time_ns())
+    iv = interest_vector(interests)
+    rv = room_vectors()
+    visits = home.get("visits") or {}
+    total = max(1, sum(visits.values()))
+
+    here = (home.get("where") or {}).get(who)
+    scores = {}
+    for name, v in rv.items():
+        pull = float(iv @ v) if iv.any() else 0.0
+        fresh = 1.0 - 0.5 * (visits.get(name, 0) / total)
+        objs = len((home.get("objects") or {}).get(name, []))
+        # 먼 방은 덜 간다 — 거리가 있어야 '돌아다닌다'가 된다
+        far = distance(here, name) if here else 0.0
+        body = fit(who, name)        # 몸에 맞는 방에 조금 더 오래
+        scores[name] = ((pull + 0.15 * math.log1p(objs)) * fresh
+                        - 0.12 * far) * (0.85 + 0.15 * body["stay"])
+
+    names = list(scores)
+    z = [math.exp(scores[n] / max(1e-6, MOVE_TEMP)) for n in names]
+    tot = sum(z)
+    r = rng.random() * tot
+    acc = 0.0
+    picked = names[-1]
+    for n, w in zip(names, z):
+        acc += w
+        if acc >= r:
+            picked = n
+            break
+
+    home.setdefault("where", {})[who] = picked
+    home.setdefault("visits", {})[picked] = visits.get(picked, 0) + 1
+    return picked
+
+
+def dwell(state, room: str, weight: float = DWELL_WEIGHT, rng=None) -> list:
+    """
+    머문 방의 결이 관심에 스민다. **이 집의 핵심.**
+    부엌에 오래 있으면 재료가 궁금해지고, 다락에 있으면 옛것이 떠오른다.
+
+    다만 방의 낱말을 그대로 관심사로 넣으면 '책·기록·역사' 같은 일반어가
+    관심 지형을 채운다. 그래서 두 갈래로 나눈다.
+      · 이미 있는 관심 중 그 방의 결과 가까운 것을 **밀어준다** (주된 효과)
+      · 새 낱말은 가끔, 아주 작게만 들어온다 (씨앗 하나 떨어지듯)
+    """
+    rng = rng or random.Random(time.time_ns())
+    words = ROOMS.get(room, [])
+    if not words:
+        return []
+    rv = _vec(" ".join(words))
+    bumped = []
+
+    # 1) 이 방과 가까운 '기존 관심'을 밀어준다
+    for t, w in sorted((state.interests or {}).items(), key=lambda kv: -kv[1])[:20]:
+        sim = float(rv @ _vec(t))
+        if sim > 0.25:
+            state.interests[t] = max(0.0, min(5.0, w + weight * sim * 2))
+            bumped.append(t)
+        if len(bumped) >= 3:
+            break
+
+    # 2) 새 낱말은 가끔 하나만, 작게
+    if rng.random() < 0.25:
+        w0 = rng.choice(words)
+        old = float((state.interests or {}).get(w0, 0.0))
+        state.interests[w0] = max(0.0, min(5.0, old + weight * 0.4))
+        bumped.append(w0)
+    return bumped[:4]
+
+
+# ── 자율: 꾸미기 ─────────────────────────────────────────────
+def build(home: dict, who: str, interests: dict, rng=None) -> dict | None:
+    """
+    요즘 관심에서 이름을 얻어 물건을 만들거나 옮긴다.
+    무엇을 만들어뒀는지가 그 시기의 기록이 된다.
+    """
+    rng = rng or random.Random(time.time_ns())
+    if rng.random() > BUILD_CHANCE:
+        return None
+    top = [t for t, _ in sorted((interests or {}).items(),
+                                key=lambda kv: -kv[1])[:6]]
+    if not top:
+        return None
+    try:
+        from organism.curiosity import _is_topic_like
+        top = [t for t in top if _is_topic_like(t)]
+    except Exception:
+        pass
+    if not top:
+        return None
+
+    room = home.get("where", {}).get(who) or rng.choice(list(ROOMS))
+    objs = home.setdefault("objects", {}).setdefault(room, [])
+    name = rng.choice(top)
+
+    if objs and rng.random() < 0.3:          # 옮기기
+        item = objs.pop(rng.randrange(len(objs)))
+        other = rng.choice([r for r in ROOMS if r != room])
+        home["objects"].setdefault(other, []).append(item)
+        ev = {"at": time.time(), "who": who, "what": "옮김",
+              "item": item.get("name"), "from": room, "to": other}
+    else:                                    # 만들기
+        if any(o.get("name") == name for o in objs):
+            return None
+        item = {"name": name, "by": who, "at": time.time()}
+        objs.append(item)
+        home["objects"][room] = objs[-8:]     # 방마다 여덟 개까지
+        ev = {"at": time.time(), "who": who, "what": "만듦",
+              "item": name, "room": room}
+    home.setdefault("log", []).append(ev)
+    return ev
+
+
+# ── 한 회차 ──────────────────────────────────────────────────
+def stir(state, home: dict, who: str, room: str, moved_from: str = None,
+         weight: float = 0.04) -> list:
+    """
+    방에서 오는 것은 **전부 호기심으로 간다.**
+      · 처음 온 방      낯설다 → 그 방의 결이 더 세게
+      · 멀리서 온 길    멀리 왔다 → 자극이 크다
+      · 남이 놓아둔 것  누가 뒀지? → 그 물건 이름이 관심으로
+    공간이 관심의 밭이라는 건 이런 뜻이다.
+    """
+    bumped = []
+    visits = (home.get("visits") or {}).get(room, 0)
+    first = 1.6 if visits <= 1 else 1.0
+    far = 1.0 + 0.25 * (distance(moved_from, room) if moved_from else 0.0)
+    body = fit(who, room)            # 몸과 방이 안 맞으면 더 잘 보인다
+    far *= body["notice"]
+    sm = stim(room)                  # 밝은 방은 눈에 들어오고, 조용한 방은 곱씹게 된다
+    far *= (0.85 + 0.3 * sm["lift"])
+
+    for w in ROOMS.get(room, [])[:2]:
+        old = float((state.interests or {}).get(w, 0.0))
+        state.interests[w] = max(0.0, min(5.0, old + weight * first * far))
+        bumped.append(w)
+
+    # 남이 놓아둔 물건은 더 궁금하다
+    for o in ((home.get("objects") or {}).get(room) or [])[-3:]:
+        nm, by = o.get("name"), o.get("by")
+        if not nm or by == who:
+            continue
+        old = float((state.interests or {}).get(nm, 0.0))
+        state.interests[nm] = max(0.0, min(5.0, old + weight * 1.5))
+        bumped.append(nm)
+    return bumped[:4]
+
+
+def outside_tick(sb, h: dict, state, mode: str = "hourly",
+                 rng=None, log=print) -> dict:
+    """
+    바깥에 나가 **1~2회차 머문다.**
+
+    예전에는 그 회차 안에 다녀와서, 지도에서는 늘 집 안에만 있는 것처럼
+    보였다. 이제는 나가면 거기 있고, 돌아와야 집에 있다.
+
+    규칙
+      · 평소엔 자기 집에 머물 확률이 높다
+      · 심심하거나 들뜨면 나갈 확률이 올라간다
+      · **밤에는 무조건 집으로** 돌아온다
+      · 피우피우는 자기 판단으로 움직이되, 몰랑이를 따라나서기도 한다
+    """
+    import random as _r
+    rng = rng or _r.Random(time.time_ns())
+    out = h.setdefault("outside", {})
+
+    if mode == "nightly":
+        came = [f"{w}({v.get('place')})" for w, v in list(out.items())]
+        if came:
+            out.clear()
+            log(f"  🌙 {', '.join(came)} 집에 돌아왔다")
+        return {"home_by_night": came}
+
+    mood = ((getattr(state, "moods", None) or [{}])[-1] or {})
+    bored = mood.get("name") in ("심심함", "들뜸")
+
+    back = []
+    for who in list(out):
+        out[who]["left"] = int(out[who].get("left", 1)) - 1
+        if out[who]["left"] <= 0:
+            back.append(f"{who}({out[who]['place']})")
+            out.pop(who)
+    if back:
+        log(f"  🏠 {', '.join(back)} 에서 돌아왔다")
+
+    try:
+        import land as _ld
+        places = [p.get("kind") for p in (_ld.load(sb).get("places") or [])
+                  if p.get("kind")]
+    except Exception:
+        places = []
+
+    went = {}
+    if places and "molang" not in out:
+        if rng.random() < (0.45 if bored else 0.12):
+            where = rng.choice(places)
+            out["molang"] = {"place": where, "left": rng.randint(1, 2)}
+            went["molang"] = where
+            log(f"  🚶 몰랑이가 {where}에 나갔다 ({out['molang']['left']}회차)")
+
+    if places and "piupiu" not in out:
+        if "molang" in out and rng.random() < 0.55:
+            out["piupiu"] = dict(out["molang"])
+            went["piupiu"] = out["piupiu"]["place"]
+            log("  🐤 피우피우도 따라나섰다")
+        elif rng.random() < (0.3 if bored else 0.08):
+            where = rng.choice(places)
+            out["piupiu"] = {"place": where, "left": rng.randint(1, 2)}
+            went["piupiu"] = where
+            log(f"  🐤 피우피우가 {where}에 나갔다")
+
+    return {"outside": {k: v["place"] for k, v in out.items()},
+            "went": went, "back": back}
+
+
+def tick(sb, state, piu_interests: dict = None, rng=None, log=print) -> dict:
+    """집에서 일어나는 한 회차. 관심 → 이동 → 머묾 → 자극 → 꾸미기."""
+    rng = rng or random.Random(time.time_ns())
+    home = load(sb)
+    prev = dict(home.get("where") or {})
+
+    mol_room = move(home, "molang", state.interests, rng)
+    piu_room = move(home, "piupiu", piu_interests or state.interests, rng)
+
+    bumped = dwell(state, mol_room, rng=rng)   # 관심의 방향 (1순위)
+    bumped += stir(state, home, "molang", mol_room, prev.get("molang"))
+    if piu_interests is not None:
+        stir(type("S", (), {"interests": piu_interests})(),
+             home, "piupiu", piu_room, prev.get("piupiu"))
+    if piu_interests is not None:              # 피우피우도 제 방의 결을 받는다
+        dwell(type("S", (), {"interests": piu_interests})(), piu_room, rng=rng)
+    built = [e for e in (build(home, "molang", state.interests, rng),
+                         build(home, "piupiu", piu_interests or state.interests,
+                               rng)) if e]
+
+    save(sb, home)
+    mol_fit, piu_fit = fit("molang", mol_room), fit("piupiu", piu_room)
+    same = mol_room == piu_room
+    log(f"  집: 몰랑이 {mol_room}({mol_fit['feel']}) · "
+        f"피우피우 {piu_room}({piu_fit['feel']})"
+        + ("  (같은 방)" if same else "")
+        + (f" · {built[0]['who']}가 {built[0]['item']}를 {built[0]['what']}"
+           if built else ""))
+    return {"molang": mol_room, "piupiu": piu_room, "same_room": same,
+            "moved": {"molang": prev.get("molang") != mol_room,
+                      "piupiu": prev.get("piupiu") != piu_room},
+            "dist": round(distance(prev.get("molang") or mol_room, mol_room), 1),
+            "fit": {"molang": mol_fit["feel"], "piupiu": piu_fit["feel"]},
+            "stim": stim(mol_room),
+            "dwell_bumped": sorted(set(bumped))[:5], "built": built,
+            "objects": {r: [o["name"] for o in v]
+                        for r, v in (home.get("objects") or {}).items() if v}}
+
+
+def describe(home: dict) -> str:
+    """집을 한 줄로 (프롬프트에 넣을 때)."""
+    w = home.get("where") or {}
+    objs = home.get("objects") or {}
+    here = ", ".join(f"{k}: {v}" for k, v in w.items())
+    stuff = "; ".join(f"{r}({', '.join(o['name'] for o in v)})"
+                      for r, v in objs.items() if v)
+    return f"[집] {here}" + (f" · 물건 — {stuff}" if stuff else "")
+

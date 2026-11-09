@@ -1,0 +1,355 @@
+"""
+curiosity_growth.py — 호기심이 '아는 것'만 늘리지 않고 '판단하는 방식'을 바꾼다.
+
+지금까지의 끊긴 고리
+  호기심 루프 → 관측 저장(organism_observations) → 끝.
+  사고 트리는 대화로만 바뀌었다. 검색으로 아무리 많이 알아도
+  판단 구조는 그대로였다. 지식 축적이지 진화가 아니다.
+
+여기서 잇는 세 갈래
+
+  1. 근거 기억 (feed_tree_memory)
+     승인된 관측을 그 주제와 맞는 트리의 기억으로 넣는다.
+     다음에 같은 주제를 판단할 때 그 트리가 이 근거를 맥락으로 쓴다.
+     → 같은 질문이라도 아는 게 늘면 답이 달라진다.
+
+  2. 판단 단계 깊어지기 (deepen)
+     한 주제를 여러 번 파고들어 근거가 쌓이면, 그 트리에 판단 단계를
+     하나 더 붙인다. "그냥 답한다" → "무엇이 알려졌나 → 무엇이 아직 모르나
+     → 답한다" 처럼 구조가 깊어진다.
+     기준: 그 트리의 기억이 임계치를 넘고, 최근 경로가 늘 같을 때
+     (같은 길만 반복한다 = 더 나눌 여지가 있다)
+
+  3. 새 사고 유형 (propose_type)
+     기존 어느 유형으로도 잘 안 풀리는 주제 무리가 쌓이면,
+     LLM에게 새 사고 단계를 설계하게 하고 트리를 만든다.
+     tree_registry 의 과생성 방지(상한 12개, 화제성 이름 거부)를 그대로 따른다.
+
+원칙
+  · 구조 변경은 드물어야 한다. 매번 바뀌면 그건 구조가 아니다.
+  · 변경은 기록에 남는다 (registry.creation_log / 감사 로그).
+  · 사람이 승인한 관측만 근거가 된다. 격리된 것은 들어가지 않는다.
+"""
+from __future__ import annotations
+import os
+
+MEM_TO_DEEPEN = 8
+MEM_STEP_TO_DEEPEN = 5   # 다시 깊어지려면 근거가 이만큼 더 쌓여야          # 트리 기억이 이만큼 쌓이면 단계 하나 더
+SAME_PATH_RUNS = 5         # 최근 경로가 이만큼 연속 같으면 나눌 여지가 있다
+MAX_DEPTH_ADD = 3          # 한 트리에 이 이상은 안 깊어진다
+
+
+def _embed(text):
+    from organism.embedder import hashed_embedding
+    return hashed_embedding(text or "", dim=64)
+
+
+def _is_live(registry, tid: str) -> bool:
+    """
+    실제로 걸어본 길인가.
+
+    경로 기록이 있거나, 단계 이름이 한국어로 적힌 것만 산 유형으로 본다.
+    (영어 지시문뿐인 기본 유형은 한국어 대화에서 골라지지 않는다)
+    """
+    t = registry.trees.get(tid)
+    if t is None:
+        return False
+    if len(getattr(t, "history", []) or []) > 0:
+        return True
+    try:
+        import re as _re
+        for n in (getattr(t, "nodes", {}) or {}).values():
+            name = (getattr(n, "name", "") or
+                    (n.get("name") if isinstance(n, dict) else "")) or ""
+            if _re.search(r"[가-힣]", name):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _topic_tree(registry, topic: str, embed_fn=None, classify_fn=None):
+    """
+    주제에 가장 가까운 트리.
+
+    워커는 LLM 판별자를 넘기지 않는다. 그러면 낱말 겹침으로 떨어지는데,
+    주제가 '바다' 한 낱말이라 유형 예시와 겹칠 일이 없어 **매번 못 찾았다**
+    (근거가 91건 쌓였는데 fed: 0 이던 원인).
+    그래서 임베딩을 기본으로 쓰고, 그래도 못 찾으면 **가장 덜 배운 트리**에
+    붙인다. 어디든 쌓여야 깊어질 기회가 생긴다.
+    """
+    try:
+        tid = registry.classify_type(topic, embed_fn=embed_fn or _embed,
+                                     classify_fn=classify_fn)
+    except Exception:
+        tid = None
+
+    # **쓰이지 않는 유형에는 먹이지 않는다.**
+    #
+    # 해시 임베딩은 뜻이 아니라 글자를 본다. 그래서 지시문이 영어인
+    # 기본 유형(syllogism 등)이 한국어 주제와 엉뚱하게 가까워 보였고,
+    # 근거 236건이 **한 번도 걸어본 적 없는 길**에 쌓였다.
+    # 그동안 실제로 169번 쓰인 emotion_analysis 는 근거가 11건뿐이었다.
+    if tid and tid in registry.trees and not _is_live(registry, tid):
+        tid = None
+
+    if tid and tid in registry.trees:
+        return tid, registry.trees[tid]
+    if not registry.trees:
+        return None, None
+
+    # 못 찾으면 **자주 걷는 길 중 근거가 모자란 곳**에 붙인다.
+    #
+    # 그냥 '가장 덜 배운 곳' 으로 보내면 고르게 퍼지기는 하는데,
+    # 정작 169번 걸은 emotion_analysis 가 근거 11건으로 남는다.
+    # 많이 걷는 길일수록 근거가 받쳐줘야 깊어진다.
+    # 그래서 **걸은 횟수 대비 근거가 적은 쪽**을 먼저 채운다.
+    live = [k for k in registry.trees if _is_live(registry, k)]
+    pool = live or list(registry.trees)
+
+    def _need(k):
+        t = registry.trees[k]
+        walked = len(getattr(t, "history", []) or [])
+        got = len(getattr(t, "memory", []) or [])
+        # 한 곳에 너무 몰리면 다른 길이 영영 안 깊어진다.
+        # 근거가 쌓일수록 급한 정도가 줄어 자연히 다음 길로 넘어간다.
+        if got >= 60:
+            return 0.0
+        return -((walked + 1) / (got + 1))
+
+    tid = min(pool, key=_need)
+    return tid, registry.trees[tid]
+
+
+def feed_tree_memory(sb, registry, limit=20, embed_fn=None, classify_fn=None,
+                     log=print, subs=None):
+    """
+    1) 승인된 관측(status='candidate')을 주제에 맞는 트리의 기억으로.
+    반환: {'fed': n, 'trees': [...]}
+    """
+    try:
+        # **아직 안 먹인 것만** 가져온다.
+        # 예전에는 최신 20건을 가져와 그중 안 먹인 것을 골랐다. 그러면
+        # 앞쪽 20건이 다 먹은 것일 때 뒤에 남은 미먹인 관측을 영영 못 본다
+        # ("가져온 20건 중 이미먹임 20" 이 그 상태였다).
+        q = (sb.table("organism_observations")
+             .select("id,topic,title,text,url,status,fed")
+             .eq("status", "candidate"))
+        try:
+            rows = (q.or_("fed.is.null,fed.eq.false")
+                    .order("id", desc=True).limit(limit).execute().data) or []
+        except Exception:
+            # or_ 를 못 쓰는 판이면 예전 방식으로 (더 넉넉히 가져온다)
+            rows = (sb.table("organism_observations")
+                    .select("id,topic,title,text,url,status,fed")
+                    .eq("status", "candidate")
+                    .order("id", desc=True).limit(limit * 10)
+                    .execute().data) or []
+            rows = [r for r in rows if not r.get("fed")][:limit]
+    except Exception as e:
+        return {"fed": 0, "error": str(e)}
+
+    # 왜 안 먹여졌는지 남긴다. 예전에는 조용히 건너뛰어서
+    # fed: 0 만 보이고 원인을 알 수 없었다.
+    fed, touched = 0, set()
+    skip = {"already_fed": 0, "no_tree": 0, "refused": 0}
+    if not registry.trees:
+        return {"fed": 0, "error": "트리가 하나도 없음 (registry 복원 실패?)",
+                "rows": len(rows)}
+
+    for r in rows:
+        if r.get("fed"):
+            skip["already_fed"] += 1
+            continue
+        topic = r.get("topic") or ""
+        tid, tree = _topic_tree(registry, topic, embed_fn, classify_fn)
+        if tree is None:
+            skip["no_tree"] += 1
+            continue
+        body = f"[{topic}] {(r.get('title') or '')} — {(r.get('text') or '')[:300]}"
+        # 목적에 걸린 분야는 근거를 더 무겁게 쌓는다 —
+        # 그래야 그쪽 사고가 먼저 깊어진다
+        trust = 0.6
+        if subs:
+            try:
+                import purpose_drive
+                trust = min(0.95, 0.6 * purpose_drive.feed_weight(subs, topic))
+            except Exception:
+                pass
+        try:
+            ok = tree.remember(body, trust=trust, context=topic)
+        except Exception:
+            ok = False
+        if not ok:
+            skip["refused"] += 1
+        if ok:
+            fed += 1
+            touched.add(tid)
+            try:                      # 같은 관측을 두 번 먹이지 않는다
+                sb.table("organism_observations").update(
+                    {"fed": True}).eq("id", r["id"]).execute()
+            except Exception:
+                pass
+    if fed:
+        log(f"  근거 → 사고 기억 {fed}건 ({', '.join(sorted(touched))})")
+    elif rows:
+        log(f"  근거를 못 먹임: 가져온 {len(rows)}건 중 "
+            f"이미먹임 {skip['already_fed']} · 트리없음 {skip['no_tree']} "
+            f"· 거절 {skip['refused']}")
+    return {"fed": fed, "trees": sorted(touched), "rows": len(rows),
+            "skip": skip, "trees_loaded": len(registry.trees)}
+
+
+def deepen(registry, log=print, subs=None):
+    """
+    2) 근거가 쌓였는데 늘 같은 길만 지나는 트리에 판단 단계를 하나 더 붙인다.
+    반환: 깊어진 트리 목록
+    """
+    from thought_structure import JudgmentNode
+    grown = []
+    for tid, t in list(registry.trees.items()):
+        need = MEM_TO_DEEPEN
+        try:
+            if subs:
+                import purpose_drive
+                need = purpose_drive.deepen_threshold(subs, tid, MEM_TO_DEEPEN)
+        except Exception:
+            pass
+        if len(getattr(t, "memory", [])) < need:
+            continue
+        added = sum(1 for n in t.nodes if str(n).startswith("grown_"))
+        if added >= MAX_DEPTH_ADD:
+            continue
+
+        # **새 근거 없이 또 깊어지지 않는다.**
+        # 예전에는 길만 같으면 회차마다 단계를 붙였다. inquiry 가 기억 9건
+        # 그대로인데 두 회차 연속 깊어진 게 그 때문이다.
+        # 깊어지는 건 '새로 알게 된 것이 쌓였을 때' 일어나야 한다.
+        mem_now = len(getattr(t, "memory", []))
+        last_mem = getattr(t, "_grown_at_mem", None)
+        if last_mem is not None and mem_now < last_mem + MEM_STEP_TO_DEEPEN:
+            continue
+        hist = [tuple(r.path) for r in getattr(t, "history", [])[-SAME_PATH_RUNS:]]
+        if len(hist) < SAME_PATH_RUNS or len(set(hist)) != 1:
+            continue          # 길이 갈리고 있으면 아직 나눌 필요 없다
+
+        # 마지막 판단 앞에 새 단계를 끼운다.
+        # **같은 내용을 거듭 붙이지 않는다.** 예전에는 '아는 것과 모르는 것
+        # 가르기'가 한 트리에 세 번 들어갔다. 그러면 깊어진 게 아니라
+        # 같은 말을 세 번 하는 것이고, grown_nodes 숫자만 부푼다.
+        path = list(hist[0])
+        if len(path) < 2:
+            continue
+        before, last = path[-2], path[-1]
+
+        # 근거가 쌓인 정도에 따라 **다른 단계**를 붙인다
+        stages = [
+            ("아는 것과 모르는 것 가르기",
+             "지금까지 알아낸 근거로 말할 수 있는 것과, 아직 근거가 없어 "
+             "모른다고 해야 하는 것을 먼저 나눈 뒤 답한다."),
+            ("근거끼리 맞춰 보기",
+             "쌓인 근거들이 서로 맞는지, 어긋나는 게 있는지 먼저 견준다. "
+             "어긋나면 어느 쪽이 더 확실한지 말한다."),
+            ("아직 모르는 쪽을 물어볼 거리로",
+             "모른다고 한 것 중 무엇을 더 알면 판단이 달라지는지 짚는다."),
+        ]
+        used = {n.prompt for n in t.nodes.values()}
+        stage = next((s for s in stages if s[0] not in used), None)
+        if stage is None:
+            continue                       # 붙일 만한 새 단계가 없다
+
+        nid = f"grown_{tid}_{added + 1}"
+        node = JudgmentNode(id=nid, prompt=stage[0], directive=stage[1])
+        try:
+            t.add_node(node)
+            t.add_branch(before, nid, prob=0.5)
+            t.add_branch(nid, last, prob=1.0)
+            t._normalize(before)
+            t._grown_at_mem = mem_now     # 다음 성장은 근거가 더 쌓인 뒤에
+            grown.append(tid)
+            log(f"  사고 단계 추가: {tid} (기억 {len(t.memory)}건)")
+        except Exception:
+            continue
+    return grown
+
+
+def propose_type(registry, topics, api_key=None, model=None, log=print):
+    """
+    (대체됨) 새 사고 유형은 이제 structure_grow 가 **로컬에서** 만든다.
+    LLM 이 사고 틀을 설계하면 판단 틀의 주인이 바깥 모델이 된다.
+    이 함수는 호출부 호환을 위해 남겨두고, 아무것도 만들지 않는다.
+    """
+    return None
+
+
+NEW_TYPE_EVERY = 40      # 관측이 이만큼 늘면 새 사고 틀을 한 번 시도한다
+MERGE_MIN_USES = 6          # 이만큼은 쓰여야 합칠 후보
+MERGE_MIN_MEM = 3           # 근거도 이만큼 쌓였을 때
+
+
+def merge_candidates(registry, log=print):
+    """
+    합칠 만한 짝 고르기.
+    둘 다 자주 쓰였고 근거도 쌓였다면, 그 둘은 한 사고의 앞뒤일 수 있다.
+    """
+    ranked = [(tid, registry.usage_count.get(tid, 0),
+               len(getattr(t, "memory", []) or []))
+              for tid, t in registry.trees.items()]
+    ranked = [r for r in ranked
+              if r[1] >= MERGE_MIN_USES and r[2] >= MERGE_MIN_MEM
+              and "__" not in r[0]]
+    ranked.sort(key=lambda r: -(r[1] + r[2]))
+    if len(ranked) < 2:
+        return None
+    return registry.merge_deep(ranked[0][0], ranked[1][0], log=log)
+
+
+def run(sb, registry, state=None, api_key=None, embed_fn=None, classify_fn=None,
+        log=print, subs=None):
+    """세 갈래를 한 번에. 워커가 호출한다."""
+    out = {}
+    out["memory"] = feed_tree_memory(sb, registry, embed_fn=embed_fn,
+                                     classify_fn=classify_fn, log=log,
+                                     subs=subs)
+    out["deepened"] = deepen(registry, log=log, subs=subs)
+    # 구조 판정기는 결과로 배운다 (쓰인 유형 = 좋은 설계)
+    try:
+        import logic_check
+        sc, info = logic_check.learn_from_outcomes(
+            registry, getattr(registry, "logic_scorer", None), log=log)
+        registry.logic_scorer = sc
+        out["logic_model"] = info
+    except Exception as e:
+        out["logic_model"] = {"error": str(e)[:80]}
+
+    # 늘 함께 쓰이는 두 사고를 하나로 — 넓어지기만 하지 않고 깊어지게
+    try:
+        out["merged"] = merge_candidates(registry, log=log)
+    except Exception as e:
+        out["merged"] = f"실패: {str(e)[:60]}"
+    # 새 사고 틀은 **자료가 쌓였을 때** 자란다.
+    #
+    # 예전 조건은 '어느 트리로도 안 잡히는 주제가 2개 이상' 이었다.
+    # 그런데 트리 찾기를 '못 찾으면 가장 덜 배운 트리에 붙인다' 로 고치면서
+    # 고아 주제가 영영 안 생겨 이 단계가 한 번도 돌지 않았다.
+    # (고치려던 두 가지가 서로를 막은 셈이다)
+    #
+    # 그래서 기준을 바꾼다: **관측이 NEW_TYPE_EVERY 건 늘 때마다 한 번 시도.**
+    # 자라야 할 근거가 쌓였을 때 자라는 것이 자연스럽다.
+    # 만들지 말지는 structure_grow 와 logic_check 가 정한다
+    # (갈래가 안 갈리면 거부, 기존 유형과 겹치면 거부).
+    if state is not None:
+        try:
+            seen = int(getattr(state, "obs_at_last_type", 0) or 0)
+            now = len(getattr(state, "observations", []) or [])
+            if now - seen >= NEW_TYPE_EVERY:
+                import structure_grow
+                out["new_type"] = structure_grow.grow(sb, registry, api_key,
+                                                      log=log)
+                state.obs_at_last_type = now
+            else:
+                out["new_type"] = {"skip": f"관측 {now - seen}건 늘어남 "
+                                           f"(필요 {NEW_TYPE_EVERY})"}
+        except Exception as e:
+            out["new_type"] = {"error": str(e)[:80]}
+    return out
