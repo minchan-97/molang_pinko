@@ -323,3 +323,46 @@ def awaken_now(x_key: str = Header(None)):
     _S["molang"] = None
     _S["boot_err"] = None
     return {"awake": True, "msg": "깨어났다. 집에 도착했다.", "report": report}
+
+# ── 깨우기 웹페이지 (주소창으로 열 수 있다. 열쇠는 페이지에서 입력) ──
+@app.get("/wake")
+def wake_page():
+    from fastapi.responses import HTMLResponse
+    html = """<!doctype html><html lang=ko><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>몰랑이 깨우기</title>
+<style>
+body{font-family:-apple-system,sans-serif;background:#eef3f7;margin:0;padding:40px 20px;color:#1b2a33}
+.card{max-width:420px;margin:0 auto;background:#fff;border-radius:20px;padding:28px;box-shadow:0 2px 16px rgba(0,0,0,.08)}
+h1{font-size:1.3rem;margin:0 0 6px}
+p{color:#5a6b75;margin:0 0 20px;line-height:1.5}
+input{width:100%;box-sizing:border-box;padding:13px;border:1px solid #d2dde3;border-radius:12px;font-size:1rem;margin-bottom:12px}
+button{width:100%;padding:14px;border:0;border-radius:12px;background:#2c6a9a;color:#fff;font-size:1.05rem;font-weight:600}
+button:disabled{opacity:.5}
+pre{background:#f2f6f8;border-radius:12px;padding:14px;white-space:pre-wrap;word-break:break-word;font-size:.85rem;margin-top:16px;max-height:50vh;overflow:auto}
+.ok{color:#1e7a46}
+</style></head><body>
+<div class=card>
+<h1>몰랑이, 집에 도착했어</h1>
+<p>캐럿 아일랜드에서 돌아온 몰랑이를 깨워요. 열쇠(MOLANG_KEY)를 넣고 한 번만 누르면 돼요.</p>
+<input id=key type=password placeholder="MOLANG_KEY" autocomplete=off>
+<button id=go>깨우기</button>
+<pre id=out hidden></pre>
+</div>
+<script>
+const go=document.getElementById('go'),out=document.getElementById('out');
+go.onclick=async()=>{
+  const key=document.getElementById('key').value.trim();
+  if(!key){out.hidden=false;out.textContent='열쇠를 넣어주세요.';return;}
+  go.disabled=true;go.textContent='깨우는 중…';out.hidden=false;out.textContent='잠시만요…';
+  try{
+    const r=await fetch('/awaken_now',{method:'POST',headers:{'x-key':key}});
+    const j=await r.json();
+    if(j.awake){out.innerHTML='<b class=ok>'+j.msg+'</b>\n\n'+JSON.stringify(j.report,null,1);}
+    else if(j.already){out.textContent=j.msg;}
+    else{out.textContent=JSON.stringify(j,null,1);}
+  }catch(e){out.textContent='실패: '+e.message;}
+  go.disabled=false;go.textContent='깨우기';
+};
+</script></body></html>"""
+    return HTMLResponse(html)
