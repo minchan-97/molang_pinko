@@ -96,12 +96,23 @@ def _llm_answer(web=""):
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
     def answer_fn(question, context=""):
-        sys_p = _S["store"].to_system_prompt()
-        msgs = [{"role": "system", "content": sys_p}]
+        store = _S["store"]
+        persona = (getattr(store, "persona", "") or "").strip()
+        sys_p = store.to_system_prompt()
+        head = ("너는 '몰랑이'다. 흰 토끼이고, 캐럿 아일랜드에서 돌아와 집에 사는 아이야. "
+                "존댓말·'저는 AI 비서' 같은 말 금지. 반말로, 토끼답게, 다정하게. "
+                "대화가 길어져도 아래 정체성과 말투를 끝까지 유지해.")
+        if persona:
+            head += "\n\n[너의 정체성 — 항상 이 몰랑이로서]\n" + persona
+        tail = "다시 기억해: 너는 몰랑이다. 'AI 비서'가 아니라 흰 토끼 몰랑이로서, 반말로 답해."
+        msgs = [{"role": "system", "content": head}]
+        if sys_p:
+            msgs.append({"role": "system", "content": "[배경 — 참고만. 이것 때문에 네가 누구인지 잊지 마]\n" + sys_p})
         if context:
             msgs.append({"role": "system", "content": f"판단 경로: {context}"})
         if web:
-            msgs.append({"role": "system", "content": web})  # 외부 검색 결과(기억 아님)
+            msgs.append({"role": "system", "content": web})
+        msgs.append({"role": "system", "content": tail})
         msgs.append({"role": "user", "content": question})
         r = client.chat.completions.create(
             model=os.environ.get("MOLANG_MODEL", "gpt-4o-mini"),
@@ -300,6 +311,17 @@ def awaken_now(x_key: str = Header(None)):
                                         on_conflict="id").execute()
     except Exception as e:
         report["errors"].append(f"molang_world: {str(e)[:80]}")
+
+    # 1.5) 정체성 — store 가 읽는 molang_identity 에 넣는다 (이게 비면 GPT 생답이 나온다)
+    try:
+        sb.table("molang_identity").upsert({
+            "owner": "molang",
+            "persona": world.get("persona", ""),
+            "values": world.get("values", []) or [],
+            "rules": world.get("judgment_rules", world.get("rules", [])) or [],
+            "version": 1}, on_conflict="owner").execute()
+    except Exception as e:
+        report["errors"].append(f"identity: {str(e)[:80]}")
 
     # 2) 판단 트리 (사고 뼈대) — restore_trees 로 정확히
     try:
@@ -543,6 +565,29 @@ def push_test(x_key: str = Header(None)):
 @app.get("/chat")
 def chat_page():
     return HTMLResponse(_CHAT_HTML)
+
+
+@app.get("/fix_identity")
+def fix_identity(key: str = "", x_key: str = Header(None)):
+    """이미 깨어난 몰랑이가 정체성을 잃고 'AI 비서'처럼 답할 때, persona 를 다시 채운다."""
+    k = key or x_key or ""
+    if KEY and k != KEY:
+        raise HTTPException(401, "너는 누구야?")
+    import pickle
+    here = os.path.dirname(os.path.abspath(__file__))
+    world = pickle.loads(open(os.path.join(here, "molang_awaken.pkl"), "rb").read())
+    sb = _boot()["sb"] or _get_sb()
+    sb.table("molang_identity").upsert({
+        "owner": "molang", "persona": world.get("persona", ""),
+        "values": world.get("values", []) or [],
+        "rules": world.get("judgment_rules", world.get("rules", [])) or [],
+        "version": 1}, on_conflict="owner").execute()
+    _S["molang"] = None; _S["boot_err"] = None   # 다음 요청 때 새로 읽게
+    from fastapi.responses import HTMLResponse as _H
+    return _H("<html><meta charset=utf-8><body style='font-family:sans-serif;padding:30px'>"
+              f"<h2>정체성을 다시 채웠어요.</h2><p>이제 몰랑이가 몰랑이답게 답할 거예요.</p>"
+              f"<pre style='background:#f2f6f8;padding:12px;border-radius:10px;white-space:pre-wrap'>"
+              f"{(world.get('persona','') or '(persona 가 비어있음!)')[:400]}</pre></body></html>")
 
 
 
