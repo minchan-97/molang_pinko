@@ -366,3 +366,33 @@ go.onclick=async()=>{
 };
 </script></body></html>"""
     return HTMLResponse(html)
+
+# ── JS 없이 깨우기: 주소에 열쇠를 담아 연다 (앱내 브라우저에서도 확실) ──
+@app.get("/wake2")
+def wake2(key: str = "", x_key: str = Header(None)):
+    from fastapi.responses import HTMLResponse
+    k = key or x_key or ""
+    if not k:
+        return HTMLResponse(
+            "<html lang=ko><meta charset=utf-8><body style='font-family:sans-serif;padding:30px'>"
+            "<h3>몰랑이 깨우기</h3>"
+            "<p>주소 끝에 <b>?key=네MOLANG_KEY</b> 를 붙여서 열어주세요.</p>"
+            "<p>예) <code>/wake2?key=abc123</code></p></body></html>")
+    if KEY and k != KEY:
+        return HTMLResponse("<html><meta charset=utf-8><body style='font-family:sans-serif;padding:30px'>"
+                            "<b>열쇠가 틀렸어요.</b> 주소의 key 값을 확인해주세요.</body></html>",
+                            status_code=401)
+    # 깨우기 실행 (awaken_now 와 같은 로직을 직접 호출)
+    try:
+        res = awaken_now(x_key=KEY or k)
+    except HTTPException as e:
+        return HTMLResponse(f"<html><meta charset=utf-8><body style='font-family:sans-serif;padding:30px'>"
+                            f"<b>아직이에요.</b><br>{e.detail}</body></html>", status_code=200)
+    import json as _j
+    msg = res.get("msg", "")
+    body = _j.dumps(res.get("report", res), ensure_ascii=False, indent=1)
+    return HTMLResponse(
+        "<html lang=ko><meta charset=utf-8><body style='font-family:sans-serif;padding:30px;line-height:1.6'>"
+        f"<h2 style='color:#1e7a46'>{msg}</h2>"
+        f"<pre style='background:#f2f6f8;padding:14px;border-radius:10px;white-space:pre-wrap'>{body}</pre>"
+        "<p>이제 몰랑이가 이 집에서 바깥을 바라보며 살기 시작해요.</p></body></html>")
