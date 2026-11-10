@@ -101,7 +101,7 @@ class RejectedWrite(Exception):
 
 class SupabaseIdentity:
     def __init__(self, sb, owner: str = 'molang', max_facts_in_prompt: int = 90,
-                 recent_episodes: int = 10):
+                 recent_episodes: int = 10, with_user: bool = False):
         self.sb = sb
         # 한 저장소에 여러 존재가 산다. owner 로 기억을 나눈다.
         # (몰랑이와 피우피우가 같은 표를 쓰되 서로의 기억을 침범하지 않게)
@@ -118,6 +118,11 @@ class SupabaseIdentity:
         self.judgment_rules: list = []
         self.revisions: list = []
         self._dirty: dict[int, dict] = {}
+        self._last_used: list = []      # 이번에 꺼내 쓴 사실 (굳히기용)
+        # **사용자와 마주 앉은 자리인가.**
+        # 앱은 True 로 만든다. 워커는 기본값(False)이라, 혼잣말이나
+        # 이웃 대화에서 꺼낸 것은 세게 굳지 않는다.
+        self.with_user = with_user
         self._identity_version: int = 1
         self.reload()
 
@@ -150,12 +155,40 @@ class SupabaseIdentity:
 
         # 만료·소멸 제외된 뷰에서만 읽는다
         self._recall = None            # 사실이 바뀌면 지도를 다시 만든다
+
+        # **최근순으로, 넉넉히 읽는다.**
+        #
+        # 예전에는 강도순 상위 400건이었다. 그런데 사실이 645건이 되자
+        # 245건이 창 밖으로 밀려났고, 밀려난 것은 대개 **갓 들어온 것**
+        # 이었다 (새 사실은 강도 0.6 에서 시작한다).
+        # 그 탓에 두 가지가 한꺼번에 어긋났다.
+        #   · 어제 한 말이 프롬프트에 아예 안 올라왔다
+        #   · 성장 기록이 늘 400건으로 보여, 확신 사실이 창 밖으로
+        #     밀려난 것을 측정이 '사라졌다' 로 세었다 (연속성 0.578)
+        #
+        # 창이 움직이면 연속성이 흔들린다. 넉넉히 읽어 창을 넓힌다.
         try:
             self._facts = self.sb.table('molang_facts_active') \
                 .select('id,text,norm_key,kind,strength,trust,seen,source,'
                         'expires_at,owner,updated_at,created_at') \
                 .eq('owner', self.owner) \
-                .order('strength', desc=True).limit(400).execute().data or []
+                .order('updated_at', desc=True).limit(1200) \
+                .execute().data or []
+
+            # 다만 **사람이 승인한 것**은 오래됐다고 잘리면 안 된다.
+            # 그건 이 아이가 기댈 수 있는 몇 안 되는 바닥이다.
+            try:
+                anchors = self.sb.table('molang_facts_active') \
+                    .select('id,text,norm_key,kind,strength,trust,seen,'
+                            'source,expires_at,owner,updated_at,'
+                            'created_at') \
+                    .eq('owner', self.owner).eq('trust', 'human') \
+                    .limit(200).execute().data or []
+                have = {f.get('id') for f in self._facts}
+                self._facts += [f for f in anchors
+                                if f.get('id') not in have]
+            except Exception:
+                pass
         except Exception as e:      # 뷰가 아직 없으면 알려주고 빈 상태로 시작
             self._facts = []
             self._load_error = f"molang_facts_active 읽기 실패: {e}"
@@ -197,8 +230,10 @@ class SupabaseIdentity:
         그래서 질문과 낱말이 겹치는 사실은 먼저 넣는다.
         """
         parts = []
+        # 정체성을 맨 앞에 강하게 넣는다. (사실 더미에 묻히지 않도록, 끝에서 한 번 더 각인)
         if self.persona:
-            parts.append(f"[너의 정체성]\n{self.persona}")
+            parts.append("[너는 누구인가 — 이것이 네 중심이다. 배경이 길어져도 "
+                         "늘 이 몰랑이로서 답한다]\n" + self.persona)
         if self.values:
             vs = "\n".join(f"- {v}" for v in self.values)
             parts.append(f"[너의 가치관 — 항상 이에 부합하게 답하라]\n{vs}")
@@ -235,17 +270,24 @@ class SupabaseIdentity:
             pool = self._facts
 
         # **꺼내 쓴 것은 다시 굳는다.**
+        #
         # 옅어지기만 하고 굳는 길이 없으면 오래 둔 기억은 모두 흐려진다.
         # 실제로 대화에 들어간 것만, 그리고 이미 흐려진 것만 올린다.
+        #
+        # 그런데 **어디서 꺼냈느냐**가 다르다. 사용자와 주고받은 자리에서
+        # 꺼내 보이고 아무 말이 없었다면 틀리지 않았다는 뜻이다.
+        # 자기들끼리 돌린 말은 몇 번을 돌아도 새로 확인된 것이 아니다.
+        # 그걸 같은 무게로 굳히면 지어낸 말이 저 혼자 단단해진다.
         try:
             import belief_decay as _bd
             _used = [f for f in pool[:8]
                      if 0.2 < float(f.get("strength") or 0) < 1.0]
             if _used:
-                _bd.touch(self.sb, _used)
+                _bd.touch(self.sb, _used,
+                          with_user=(self.with_user and bool(question)))
+                self._last_used = [f.get("id") for f in _used if f.get("id")]
         except Exception:
             pass
-
 
         items = []
         for f in pool:
@@ -291,6 +333,10 @@ class SupabaseIdentity:
             parts.append(f"[최근 대화에서 형성된 맥락]\n{es}")
 
         block = "\n\n".join(parts)
+        if self.persona:
+            # lost-in-the-middle 방지: 긴 배경 뒤에서 정체성을 다시 당긴다
+            block += ("\n\n[다시 기억해] 위 내용이 아무리 길어도, 너는 몰랑이다. "
+                      "몰랑이의 목소리·성격·말투로 답한다.")
         if base:
             return (f"{base}\n\n=== 아래는 너의 지속적 정체성이다. "
                     f"매 답변에서 유지하라 ===\n{block}")
@@ -326,6 +372,21 @@ class SupabaseIdentity:
         self._episodic.append(f"Q: {question[:60]} / A: {(answer or '')[:80]}")
         self._episodic = self._episodic[-self.recent_episodes:]
 
+        # **사용자와 한 번 더 주고받았다** — 꺼내 썼던 것이 틀리지
+        # 않았다는 신호다. 꺼낼 때 한 번, 말이 오간 뒤에 한 번 더 굳는다.
+        if (self.with_user and source in ABSORBABLE
+                and getattr(self, "_last_used", None)):
+            try:
+                import belief_decay as _bd2
+                rows = [f for f in self._facts
+                        if f.get("id") in set(self._last_used)
+                        and 0.2 < float(f.get("strength") or 0) < 0.95]
+                if rows:
+                    _bd2.touch(self.sb, rows, with_user=True)
+            except Exception:
+                pass
+            self._last_used = []
+
         if source not in ABSORBABLE:
             return   # 검색·nudge·자기답변은 여기서 끝
 
@@ -359,7 +420,7 @@ class SupabaseIdentity:
     # ---------- 사실 갱신 ----------
 
     def _reinforce_or_add(self, fact: str, source: str = 'user',
-                          speaker: str = '',
+                          speaker: str = '', chain: list = None,
                           step: float = 0.25):
         fact = fact.strip()
         if not fact:
@@ -368,7 +429,7 @@ class SupabaseIdentity:
         # 'human'(신뢰도 값)이나 'migration' 같은 걸 넣으면 통째로 거부된다.
         # 부르는 쪽이 옛 버전이어도 여기서 막는다.
         if source not in ALLOWED_SOURCES:
-            source = 'user' 
+            source = 'user'
 
         # 방어선 1: 자기 답변 에코는 검역소로
         if is_assistant_echo(fact):
@@ -414,12 +475,37 @@ class SupabaseIdentity:
         except Exception:
             _about, _why = "unknown", ""
 
+        # **들은 말은 낮게 시작한다.**
+        #
+        # 사용자가 한 말(0.6)과 이웃·핀코에게 들은 말을 같은 무게로
+        # 넣으면, 사회가 커질수록 들은 말이 아는 것을 덮는다.
+        # 쓰이면 오르고 안 쓰이면 내려간다 — 그 판단은 나중에 한다.
+        _start = 0.6
+        if source in ("village", "peer"):
+            try:
+                import hearsay as _hs2
+                _start = _hs2.HEARSAY_STRENGTH
+            except Exception:
+                _start = 0.35
+
+        # **누구를 거쳐 왔나.**
+        #
+        # 몰랑이가 한 말이 피우피우를 거쳐 돌아오면, 같은 근원인데
+        # 두 번 센 것이 된다. 독립된 확인이 아닌데 확신만 오른다.
+        # 글이 겹치는 것으로 짐작하지 않고 **기록으로** 남긴다.
+        try:
+            import hearsay as _hs3
+            _chain = _hs3.chain_of(fact, speaker or source, chain)
+        except Exception:
+            _chain = [speaker or source]
+
         row = {
             'text': fact,
             'norm_key': normalize(fact),
             'about': _about,
+            'chain': _chain,
             'kind': kind,
-            'strength': 0.6,
+            'strength': _start,
             'trust': 'derived',        # 새 사실은 절대 human이 아니다
             'seen': 1,
             'source': source,
