@@ -9,7 +9,7 @@ import streamlit as st
 from openai import OpenAI
 
 from unified_identity import UnifiedIdentity
-from llm_bridge import (make_choose_fn, make_answer_fn, detect_feedback,
+from llm_bridge import (make_choose_fn, make_answer_fn, detect_feedback, set_turn_context,
                         make_tree_designer, make_classifier, make_consolidator)
 from tree_registry import load_logic_db_types
 import molang_skin as skin
@@ -76,7 +76,9 @@ if "unified" not in st.session_state:
     load_logic_db_types(u.registry)          # 20종 논리 유형 탑재
     skin.install_molang_persona(u)           # 몰랑이 옷 입힘 (기본값)
     # 정체성을 서버로. skin 다음에 붙여야 DB의 persona 가 이긴다.
-    u.identity = SupabaseIdentity(sb)
+    # **사용자와 마주 앉은 자리**라고 알려 준다.
+    # 여기서 꺼내 쓴 기억은 세게 굳는다 (워커의 혼잣말과 다르게).
+    u.identity = SupabaseIdentity(sb, with_user=True)
     # 사고 트리(판단 구조)도 서버에서 복원 — 없으면 기본 유형으로 시작
     import registry_store, skin_store, purpose
     _n = registry_store.load_into(sb, u.registry)
@@ -299,6 +301,35 @@ with st.sidebar:
         _t_ask = _t_live = _t_mind = _t_check = st.container()
 
     with _t_ask:
+        # 🧩 같은 말이 여러 번 적힌 것 — **보고 고르신다**
+        #
+        # "어디 살아?" 에 답을 못 한 건 기억이 없어서가 아니라
+        # 흩어져 있어서였다. 사는 곳 하나를 두고 여섯 건이 따로 있고,
+        # 각각 0.6~0.76 이라 어느 것도 세게 올라오지 않았다.
+        #
+        # 다만 자동으로 합치면 "빵에 관심" 과 "동물에 관심" 이 묶인다.
+        # 그래서 **사람이 보고 고르게** 한다.
+        try:
+            import merge_facts as _mf
+            _plan = _mf.plan(u.identity.learned_facts)
+            if _plan:
+                st.markdown("---")
+                st.markdown(f"### 🧩 같은 말로 보이는 것 {len(_plan)}묶음")
+                st.caption("　합치면 들은 횟수만큼 확신이 오릅니다")
+                for _i, _p in enumerate(_plan[:6]):
+                    st.caption("　" + _mf.describe(_p))
+                    for _d in _p["drop"][:3]:
+                        st.caption(f"　　↳ {(_d.get('text') or '')[:40]}")
+                    if safe(st.button, "합치기", key=uk(f"mg{_i}")):
+                        _mf.apply(sb, _p["keep"] and
+                                  [_p["keep"]] + _p["drop"],
+                                  log=lambda *a: None)
+                        u.identity.reload()
+                        st.success("하나로 모았어요")
+                        st.rerun()
+        except Exception:
+            pass
+
         # 🧹 안 걸어본 길에 쌓인 근거 옮기기
         try:
             import rehome_memory as _rh, curiosity_growth as _cg
@@ -417,11 +448,30 @@ with st.sidebar:
                         _done()
 
                 elif _rule == "waiting":
+                    # **여기서 바로 답한다.**
+                    # 예전에는 "대답할게" 를 누르면 그냥 사라졌다.
+                    # 물어놓고 들을 자리를 안 만든 셈이었다.
+                    _ans = safe(st.text_input, "여기에 답해주세요",
+                                key=uk(f"ak_t{_a.get('id')}"),
+                                placeholder="예: 갔다 왔어, 비 와서 못 갔어")
                     _c1, _c2 = st.columns(2)
                     with _c1:
-                        if safe(st.button, "대답할게",
+                        if safe(st.button, "보내기",
                                 key=uk(f"ak_a{_a.get('id')}")):
                             _wid = _pay.get("wait_id")
+                            _txt = (_ans or "").strip()
+                            if _txt:
+                                # 답은 **사실로 남는다.** 몰랑이가 물어서
+                                # 들은 것이니, 그 자체가 알게 된 것이다.
+                                try:
+                                    u.identity.absorb(
+                                        _a.get("body") or "", _txt,
+                                        learned=_txt, source="user")
+                                except Exception:
+                                    pass
+                                st.session_state.chat.append(
+                                    ("molang", _a.get("body") or "", "기쁨"))
+                                st.session_state.chat.append(("me", _txt, None))
                             _done(lambda: _wid and _cr.mark_asked(sb, _wid))
                     with _c2:
                         if safe(st.button, "나중에", key=uk(f"ak_w{_a.get('id')}")):
@@ -589,6 +639,55 @@ with st.sidebar:
                     _ch = _mkm.chain({"trans": _tr}, _top[0][0], 4)
                     if len(_ch) > 1:
                         st.caption("　이어지는 결: " + " → ".join(_ch))
+        except Exception:
+            pass
+
+        # 🗺️ 두 지도 견주기 — **바꾸기 전에 눈으로 본다**
+        try:
+            import semantic_map_v as _smv, semantic_map as _smo
+            _ng, _nc = _smv.load(sb)
+            if _ng:
+                _og, _oc = _smo.load(sb)
+                _r = _smv.compare(_og, _oc, _ng, _nc)
+                st.markdown("---")
+                st.markdown("### 🗺️ 지도 둘 (지금 / 벡터)")
+                for _k in ("마디", "실", "갈래", "자리못잡음"):
+                    _a, _b = _r[_k]
+                    _m = "↑" if _b > _a else ("↓" if _b < _a else "=")
+                    st.caption(f"　{_k}: {_a} → {_b} {_m}")
+                if _r.get("새로잡힌것"):
+                    st.caption("　새로 자리 잡음: "
+                               + ", ".join(_r["새로잡힌것"][:6]))
+                _kd = (_ng.get("kinds") or {})
+                if _kd:
+                    st.caption(f"　실의 결: 겪음 {_kd.get('겪음',0)} · "
+                               f"겹침 {_kd.get('둘다',0)} · 뜻 {_kd.get('뜻',0)}")
+        except Exception:
+            pass
+
+        # 🏘️ 사회 — **몰랑이를 거치지 않는 일들**
+        try:
+            import society as _soc, council as _cnc
+            _sv = _soc.load(sb)
+            _meets = _sv.get("meets") or []
+            _cs = _sv.get("councils") or []
+            if _meets or _cs:
+                st.markdown("---")
+                st.markdown("### 🏘️ 이웃들 사이")
+                _hot = _soc.hottest(_sv, within_h=24)
+                if _hot:
+                    st.caption(f"　오늘 가장 자주 본 사이: "
+                               f"**{_hot['a']}·{_hot['b']}** "
+                               f"({_hot.get('place')}, {_hot.get('times')}번)")
+                st.caption(f"　마주침 {len(_meets)}번 · 떠도는 말 "
+                           f"{sum(len(v) for v in (_sv.get('rumors') or {}).values())}개")
+                for _c in _cs[-2:]:
+                    if _c.get("picked"):
+                        _t = (_c.get("tally") or [("", 0, 0)])[0]
+                        st.caption(f"　🗳️ **{_c['picked']}** 을(를) 짓기로 "
+                                   f"({_t[1]}:{_t[2]})")
+                    else:
+                        st.caption("　🗳️ 모임에서 과반을 못 넘음")
         except Exception:
             pass
 
@@ -765,7 +864,7 @@ with st.sidebar:
     with _t_mind:
         # 🕸️ 기억 지도 — 무엇이 무엇에 끌리는지, 무엇이 아직 엉켜 있는지
         try:
-            import semantic_map as _sm
+            import mapsource as _sm
             import word_gravity as _wgv
             _gm, _gcl = _sm.load(sb)
             if _gm.get("edges"):
@@ -854,9 +953,22 @@ with st.sidebar:
                       .in_("rule", ["purpose_sub", "purpose_core"])
                       .is_("error", "null")
                       .order("id", desc=True).limit(6).execute().data) or []
+            # 하위 목적은 molang_purposes 에 들어가니 그걸로 거른다.
             _done = {p.get("purpose") for p in purpose_growth.load_subs(sb, False)}
-            _props = [p for p in _props
-                      if (p.get("payload") or {}).get("purpose") not in _done][:3]
+
+            # **핵심 목적은 거기 안 들어간다.** 정체성에 바로 쓰인다.
+            # 그래서 승인해도 목록에서 사라지지 않았다.
+            # 지금 페르소나가 그 문장을 품고 있으면 이미 받아들인 것이다.
+            _persona = (u.identity.persona or "")
+
+            def _already(p):
+                _pl = p.get("payload") or {}
+                if p.get("rule") == "purpose_core":
+                    _new = (_pl.get("new") or "").strip()
+                    return bool(_new) and _new in _persona
+                return _pl.get("purpose") in _done
+
+            _props = [p for p in _props if not _already(p)][:3]
         except Exception:
             _props = []
         if _props:
@@ -875,6 +987,13 @@ with st.sidebar:
                 _r = purpose_growth.accept(sb, u.identity, _p)
                 if _r.get("ok"):
                     outbox.mark_sent(sb, [_p["id"]])   # 다시 안 뜨게
+                    # **바뀐 정체성을 다시 읽는다.**
+                    # 안 읽으면 화면이 옛 페르소나를 들고 있어서,
+                    # 승인한 제안이 그대로 남아 보인다.
+                    try:
+                        u.identity.reload()
+                    except Exception:
+                        pass
                     st.success("목적에 담았어요" + (f" — {_r.get('new','')}"
                                                   if _r.get("new") else ""))
                     st.rerun()
@@ -1033,6 +1152,27 @@ with st.sidebar:
                 st.caption(growth_export.summary_line(_gdata))
             except Exception as e:
                 st.caption(f"성장 기록 준비 실패: {str(e)[:60]}")
+
+            # 사회 기록 — **따로 뽑는다.**
+            #
+            # 위의 성장 기록은 한 개체가 어떻게 자랐나를 담는다.
+            # 그런데 이제 이웃들이 서로 만나고, 관심이 옮고,
+            # 다 같이 무엇을 지을지 정한다. 그건 개체의 성장이 아니라
+            # **사회의 성장**이다. 한 파일에 섞으면 둘 다 흐려진다.
+            try:
+                import society_export
+                _sdata = society_export.collect(sb)
+                st.download_button(
+                    "🏘️ 사회 기록 받기 (.pkl)",
+                    data=__import__("pickle").dumps(_sdata),
+                    file_name=f"molang_society_"
+                              f"{__import__('time').strftime('%m%d_%H%M')}.pkl",
+                    mime="application/octet-stream",
+                    key=uk("society_dl"))
+                for _line in society_export.report(_sdata).split("\n"):
+                    st.caption(_line)
+            except Exception as e:
+                st.caption(f"사회 기록 준비 실패: {str(e)[:60]}")
         except Exception as e:
             st.caption(f"백업 준비 실패: {e}")
     else:
@@ -1300,10 +1440,11 @@ if msg or photo:
         if photo:
             pb = base64.b64encode(photo.getvalue()).decode()
             try:
+                _ident = "너는 '몰랑이'다. 흰 토끼. 사진·배경이 와도 정체성과 말투를 유지한다.\n"
                 r = client.chat.completions.create(model="gpt-4o",
-                    messages=[{"role":"system","content":u.identity.to_system_prompt(question=q)+"\n"+self_ctx+"\n"+place_ctx+"\n"+time_ctx+"\n"+heard_ctx+"\n"+travel_ctx+"\n"+purpose_ctx+"\n"+guard_ctx
-                     +"\n[말투] 너는 몰랑이다. 반말로, 토끼답게, 짧고 다정하게 답한다."
-                      " '저는/하시나요' 같은 존댓말을 쓰지 마라."},
+                    messages=[{"role":"system","content":_ident+u.identity.to_system_prompt(question=q)+"\n"+self_ctx+"\n"+place_ctx+"\n"+time_ctx+"\n"+heard_ctx+"\n"+travel_ctx+"\n"+purpose_ctx+"\n"+guard_ctx
+                     +"\n\n다시 기억해: 너는 몰랑이다. 반말로, 토끼답게, 짧고 다정하게. "
+                      "'저는/하시나요' 같은 존댓말 금지."},
                         {"role":"user","content":[
                             {"type":"text","text":"이 사진 보고 몰랑이답게 반응해줘!"},
                             {"type":"image_url","image_url":{"url":f"data:{photo.type};base64,{pb}"}}]}],
@@ -1342,6 +1483,11 @@ if msg or photo:
                               f"주소: {_off.get('url','')}")
             q_with_time = (f"[최근 대화]\n{_hist}\n\n"
                            f"사용자가 방금 한 말: \"{q}\"{_offer_txt}\n{bg}")
+            # 답변 생성이 정체성을 system 맨 앞/끝에서 강제하도록, 원문과 지금 말을 넘긴다
+            try:
+                set_turn_context(getattr(u.identity, "persona", "") or "", q)
+            except Exception:
+                pass
             result = u.think(q_with_time, choose_fn=choose_fn,
                              answer_fn_factory=answer_fn_factory,
                              classify_fn=classify_fn, tree_factory=designer)
