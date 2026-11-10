@@ -31,6 +31,7 @@ from pydantic import BaseModel  # noqa: E402
 
 import looking  # noqa: E402
 import longing  # noqa: E402
+import search  # noqa: E402
 
 def _push():
     """알림 모듈은 쓸 때만 불러온다 (cryptography 미설치로 앱 전체가 죽지 않게)."""
@@ -90,7 +91,7 @@ def _boot():
     return _S
 
 
-def _llm_answer():
+def _llm_answer(web=""):
     from openai import OpenAI
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
@@ -99,6 +100,8 @@ def _llm_answer():
         msgs = [{"role": "system", "content": sys_p}]
         if context:
             msgs.append({"role": "system", "content": f"판단 경로: {context}"})
+        if web:
+            msgs.append({"role": "system", "content": web})  # 외부 검색 결과(기억 아님)
         msgs.append({"role": "user", "content": question})
         r = client.chat.completions.create(
             model=os.environ.get("MOLANG_MODEL", "gpt-4o-mini"),
@@ -114,6 +117,18 @@ def _guard():
             "아직 몰랑이가 깨어나지 않았어요. /awaken_now 를 한 번 불러 깨운 뒤 다시 와주세요. "
             f"(원인: {s['boot_err']['error']})")
     return s
+
+
+import re as _re  # noqa: E402
+
+_LOOKUP = _re.compile(
+    r"(뭐야|무엇|누구|언제|어디|어떻게|왜|알려줘|찾아|검색|궁금|최신|요즘|뉴스|"
+    r"며?칠|날씨|가격|언제야|뜻이|무슨|정보|방법|추천|있어\?|인가요|인가\?)")
+
+
+def _wants_lookup(text: str) -> bool:
+    t = (text or "").strip()
+    return len(t) >= 2 and bool(_LOOKUP.search(t))
 
 
 # ── 말 걸기 ──────────────────────────────────────────────────
@@ -144,7 +159,10 @@ def say(body: Say, x_key: str = Header(None)):
     if not prompt:
         return {"answer": "", "seen": seen}
 
-    out = s["molang"].think(prompt, answer_fn=_llm_answer())
+    web = ""
+    if search.available() and _wants_lookup(user_text):
+        web = search.search_ctx(user_text)
+    out = s["molang"].think(prompt, answer_fn=_llm_answer(web))
     answer = out.get("answer") or ""
     try:
         if user_text:
