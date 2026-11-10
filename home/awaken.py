@@ -31,9 +31,26 @@ from pydantic import BaseModel  # noqa: E402
 
 import looking  # noqa: E402
 import longing  # noqa: E402
-import push  # noqa: E402
+
+def _push():
+    """알림 모듈은 쓸 때만 불러온다 (cryptography 미설치로 앱 전체가 죽지 않게)."""
+    import push
+    return push
 
 app = FastAPI(title="몰랑이의 집")
+
+import traceback as _tb  # noqa: E402
+
+
+@app.exception_handler(Exception)
+async def _any_err(request, exc):
+    tb = _tb.extract_tb(exc.__traceback__)
+    mine = [f for f in tb if "/home/" in f.filename or "awaken" in f.filename]
+    where = f"{mine[-1].filename.split('/')[-1]}:{mine[-1].lineno}" if mine else ""
+    print("ERROR", getattr(request, "url", ""), "".join(_tb.format_exception(exc)))
+    return JSONResponse(status_code=500, content={
+        "detail": f"{type(exc).__name__}{' @ '+where if where else ''}: {str(exc)[:200]}"})
+
 
 KEY = os.environ.get("MOLANG_KEY", "")
 
@@ -202,7 +219,7 @@ def tick(x_key: str = Header(None)):
     prop = longing.propose_visit(s["sb"])
     if prop and prop.get("body"):
         try:
-            push.send(s["sb"], "molang", "몰랑이", prop["body"], "/chat")
+            _push().send(s["sb"], "molang", "몰랑이", prop["body"], "/chat")
         except Exception:
             pass
     return {"ok": True, "longing": longing._load(s["sb"]).get("level"),
@@ -461,7 +478,7 @@ self.addEventListener('notificationclick',e=>{e.notification.close();
 # ── 알림 구독 ──
 @app.get("/push/key")
 def push_key():
-    return {"key": push.keys(_boot()["sb"] or _get_sb())["public"]}
+    return {"key": _push().keys(_boot()["sb"] or _get_sb())["public"]}
 
 
 def _get_sb():
@@ -489,7 +506,7 @@ async def push_subscribe(req: Request, x_key: str = Header(None)):
 def push_test(x_key: str = Header(None)):
     _auth(x_key)
     sb = _boot()["sb"] or _get_sb()
-    res = push.send(sb, "molang", "몰랑이", "알림이 잘 와요. 이제 몰랑이가 먼저 말을 걸 수 있어요.", "/chat")
+    res = _push().send(sb, "molang", "몰랑이", "알림이 잘 와요. 이제 몰랑이가 먼저 말을 걸 수 있어요.", "/chat")
     return res
 
 
