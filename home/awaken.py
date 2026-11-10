@@ -19,8 +19,11 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core"))
+_HERE = os.path.dirname(os.path.abspath(__file__))        # home/
+_ROOT = os.path.dirname(_HERE)                            # 저장소 루트
+sys.path.insert(0, _HERE)                                 # looking, longing
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "core"))           # 몰랑이 코어
 
 from fastapi import FastAPI, Header, HTTPException  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
