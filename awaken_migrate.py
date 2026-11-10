@@ -128,7 +128,7 @@ def main():
     except Exception:
         pass
 
-    sb.table("molang_world").upsert({"id": 1, "snapshot": world}, on_conflict="id").execute()
+    sb.table("molang_world").upsert({"id": 1, "data": world}, on_conflict="id").execute()
 
     # 판단 트리(사고 뼈대) 복원 — 민찬기가 만든 restore_trees 로 정확히. 추측 없음.
     try:
@@ -152,8 +152,6 @@ def main():
         print(f"  판단 트리 {n}개 복원 (사고 뼈대 — 이 아이답게 생각한다)")
     except Exception as e:
         print(f"  ! 트리 복원 건너뜀(원본은 molang_world 에 보존됨): {str(e)[:100]}")
-    sb.table("molang_skin").upsert({"id": 1, "persona": world.get("persona", "")},
-                                   on_conflict="id").execute()
     for table, fn in CONFIRMED.items():
         rows = fn(world)
         for i in range(0, len(rows), 100):
@@ -161,12 +159,15 @@ def main():
                 sb.table(table).insert(rows[i:i+100]).execute()
             except Exception as e:
                 print(f"  ! {table} 일부 건너뜀: {str(e)[:80]}")
+    whole_col = {"molang_travel": "data", "molang_home": "layout",
+                 "molang_land": "layout", "molang_map": "graph"}
     for table, key in WHOLE.items():
         if world.get(key) is not None:
+            col = whole_col[table]
             try:
-                sb.table(table).upsert({"id": 1, "data": world[key]}, on_conflict="id").execute()
+                sb.table(table).upsert({"id": 1, col: world[key]}, on_conflict="id").execute()
             except Exception as e:
-                print(f"  ! {table} 건너뜀: {str(e)[:80]}")
+                print(f"  ! {table} 건너뜀(원본은 molang_world 에 보존): {str(e)[:80]}")
     sb.table("molang_episodes").insert({"owner": "molang", "place": ARRIVAL["place"],
                                         "question": "(돌아옴)", "answer": ARRIVAL["text"],
                                         "emotion": ARRIVAL["emotion"]}).execute()
