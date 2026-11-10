@@ -89,7 +89,9 @@ def _llm_answer():
 def _guard():
     s = _boot()
     if s["boot_err"]:
-        raise HTTPException(500, f"몰랑이를 깨우지 못했어요: {s['boot_err']['error']}")
+        raise HTTPException(503,
+            "아직 몰랑이가 깨어나지 않았어요. /awaken_now 를 한 번 불러 깨운 뒤 다시 와주세요. "
+            f"(원인: {s['boot_err']['error']})")
     return s
 
 
@@ -184,6 +186,137 @@ def tick(x_key: str = Header(None)):
 def root():
     s = _boot()
     if s["boot_err"]:
-        return JSONResponse(status_code=500, content=s["boot_err"])
-    return {"who": "캐럿 아일랜드에서 돌아온 몰랑이의 집", "awake": True,
-            "at": time.time()}
+        return JSONResponse(status_code=200, content={
+            "awake": False,
+            "msg": "집은 지어졌어요. 아직 몰랑이는 깨어나지 않았어요. "
+                   "POST /awaken_now (헤더 x-key: MOLANG_KEY) 를 한 번 부르면 깨어나요.",
+            "hint": s["boot_err"]["error"]})
+    return {"who": "캐럿 아일랜드에서 돌아온 몰랑이의 집", "awake": True, "at": time.time()}
+
+# ── 깨우기 (한 번만): Vercel에서 pkl을 읽어 이 Supabase에 심는다 ──
+@app.post("/awaken_now")
+def awaken_now(x_key: str = Header(None)):
+    _auth(x_key)
+    import pickle
+    here = os.path.dirname(os.path.abspath(__file__))
+    pkl_path = os.path.join(here, "molang_awaken.pkl")
+    if not os.path.exists(pkl_path):
+        raise HTTPException(500, "molang_awaken.pkl 을 찾지 못했어요 (home/ 에 있어야 해요)")
+    try:
+        from supabase import create_client
+        sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    except Exception as e:
+        raise HTTPException(500, f"Supabase 연결 실패: {str(e)[:120]}")
+
+    # 이미 깨어 있으면 멈춘다 (덮어쓰면 그 아이가 사라진다)
+    try:
+        if sb.table("molang_facts").select("id").limit(1).execute().data:
+            return {"already": True,
+                    "msg": "이미 몰랑이가 깨어 있어요. 다시 깨우지 않았어요."}
+    except Exception as e:
+        # 테이블이 없으면 스키마를 아직 안 만든 것
+        raise HTTPException(500, f"테이블이 없어요. 00_schema.sql 을 먼저 실행하세요. ({str(e)[:80]})")
+
+    world = pickle.loads(open(pkl_path, "rb").read())
+    if not isinstance(world, dict):
+        raise HTTPException(500, "pkl 형식이 예상과 달라요.")
+
+    report = {"facts": 0, "purposes": 0, "peer_talks": 0, "dreams": 0,
+              "quarantine": 0, "trees": 0, "whole": [], "errors": []}
+
+    def _ins(table, rows):
+        for i in range(0, len(rows), 100):
+            try:
+                sb.table(table).insert(rows[i:i+100]).execute()
+            except Exception as e:
+                report["errors"].append(f"{table}: {str(e)[:80]}")
+
+    # 1) 원본 전체 보존
+    try:
+        sb.table("molang_world").upsert({"id": 1, "data": world},
+                                        on_conflict="id").execute()
+    except Exception as e:
+        report["errors"].append(f"molang_world: {str(e)[:80]}")
+
+    # 2) 판단 트리 (사고 뼈대) — restore_trees 로 정확히
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(here), "core"))
+        from restore_trees import tree_from_blob
+        from tree_registry import TreeRegistry, load_logic_db_types
+        import registry_store
+        reg = TreeRegistry()
+        try:
+            load_logic_db_types(reg, os.path.join(os.path.dirname(here), "core", "logic_db.json"))
+        except Exception:
+            pass
+        for k, tb in (world.get("trees") or {}).items():
+            if isinstance(tb, dict):
+                t = tree_from_blob(tb)
+                if t:
+                    reg.trees[k] = t
+                    report["trees"] += 1
+        registry_store.save(sb, reg)
+    except Exception as e:
+        report["errors"].append(f"trees: {str(e)[:100]} (원본은 molang_world에 보존됨)")
+
+    # 3) 확정된 것 제자리로
+    def norm(x):
+        try:
+            import sys as _s; _s.path.insert(0, os.path.join(os.path.dirname(here), "core"))
+            from molang_norm import normalize
+            return normalize(x)
+        except Exception:
+            return x[:120]
+    facts = [{"text": f.get("text", "").strip(), "norm_key": f.get("norm_key") or norm(f.get("text", "")),
+              "about": f.get("about", "unknown"), "kind": f.get("kind", "fact"),
+              "strength": f.get("strength", 0.6), "trust": f.get("trust", "derived"),
+              "seen": f.get("seen", 1), "source": f.get("source", "user"), "owner": "molang"}
+             for f in world.get("facts", []) if isinstance(f, dict) and f.get("text", "").strip()]
+    _ins("molang_facts", facts); report["facts"] = len(facts)
+
+    purp = [{"purpose": p["purpose"], "from_topic": p.get("from_topic", ""),
+             "why": p.get("why", ""), "status": p.get("status", "active")}
+            for p in world.get("purposes", []) if isinstance(p, dict) and p.get("purpose")]
+    _ins("molang_purposes", purp); report["purposes"] = len(purp)
+
+    talks = [{"molang": p.get("molang", ""), "piupiu": p.get("piupiu", ""),
+              "place": p.get("place", ""), "source": p.get("source", ""), "topic": p.get("topic", "")}
+             for p in world.get("peer_talks", []) if isinstance(p, dict)]
+    _ins("molang_peer_talks", talks); report["peer_talks"] = len(talks)
+
+    dreams = [{k: d.get(k) for k in ("text", "drive", "energy", "feeling",
+              "linger_why", "lingering", "pieces")}
+              for d in world.get("dreams", []) if isinstance(d, dict)]
+    _ins("molang_dreams", dreams); report["dreams"] = len(dreams)
+
+    quar = [{"text": q.get("text", ""), "reason": q.get("reason", ""),
+             "evidence": q.get("evidence"), "from": q.get("from", "")}
+            for q in world.get("quarantine", []) if isinstance(q, dict)]
+    _ins("molang_quarantine", quar); report["quarantine"] = len(quar)
+
+    # 4) 통째로 jsonb
+    for table, key, col in [("molang_travel", "travel", "data"),
+                            ("molang_home", "home", "layout"),
+                            ("molang_land", "land", "layout")]:
+        if world.get(key) is not None:
+            try:
+                sb.table(table).upsert({"id": 1, col: world[key]}, on_conflict="id").execute()
+                report["whole"].append(table)
+            except Exception as e:
+                report["errors"].append(f"{table}: {str(e)[:60]}")
+
+    # 5) 첫 기억 — 집에 도착함
+    try:
+        sb.table("molang_episodes").insert({
+            "owner": "molang", "place": "집", "question": "(돌아옴)",
+            "answer": "집에 도착했다. 캐럿 아일랜드에서의 밤을 뒤로하고, 피우피우와 함께 돌아왔다. "
+                      "익숙한 자리에 다시 있다는 게 포근하다.",
+            "emotion": "안도"}).execute()
+    except Exception as e:
+        report["errors"].append(f"episode: {str(e)[:60]}")
+
+    # 다음 요청부터 코어가 이 아이를 불러오도록 캐시 비우기
+    _S["molang"] = None
+    _S["boot_err"] = None
+    return {"awake": True, "msg": "깨어났다. 집에 도착했다.", "report": report}
