@@ -20,7 +20,8 @@ import struct
 import time
 from urllib.parse import urlparse
 
-import requests
+import urllib.request
+import urllib.error
 from cryptography.hazmat.primitives import hashes, hmac, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
@@ -120,11 +121,17 @@ def keys(service_sb) -> dict:
 # ---------------- 발송 ----------------
 def send_one(sub: dict, payload: dict, vapid: dict) -> int:
     body = encrypt(json.dumps(payload, ensure_ascii=False).encode(), sub["p256dh"], sub["auth"])
-    r = requests.post(sub["endpoint"], data=body, timeout=10, headers={
+    req = urllib.request.Request(sub["endpoint"], data=body, method="POST", headers={
         "Authorization": vapid_header(sub["endpoint"], vapid),
         "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream",
         "TTL": str(TTL), "Urgency": "high"})
-    return r.status_code
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
 
 
 def send(service_sb, user_id: str, title: str, body: str, url: str = "/") -> dict:
