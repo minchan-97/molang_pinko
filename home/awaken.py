@@ -160,13 +160,14 @@ def say(body: Say, x_key: str = Header(None)):
 class Frame(BaseModel):
     image_b64: str
     user_present: bool = False      # 지금 사용자가 앞에 있나
+    on_demand: bool = True          # 버튼으로 직접 보여줄 땐 쿨다운 건너뜀
 
 
 @app.post("/look")
 def look(body: Frame, x_key: str = Header(None)):
     _auth(x_key)
     s = _guard()
-    imp = looking.look(body.image_b64, body.user_present)
+    imp = looking.look(body.image_b64, body.user_present, force=body.on_demand)
     if imp is None:
         return {"looked": False, "why": "방금 봤어 (아직 이르다)"}
     if imp.get("error"):
@@ -563,8 +564,10 @@ input[type=file]{display:none}
 <header>
  <img src="/static/icon-192.png" alt="">
  <b>몰랑이</b>
+ <button class=key id=look>🪟 바깥 보기</button>
  <button class=key id=bell>🔔 알림</button>
 </header>
+<input type=file id=lookcam accept=image/* capture=environment style=display:none>
 <div id=log></div>
 <div id=thumb><img id=thumbimg><span>사진을 같이 보낼게요</span><button id=thumbx>취소</button></div>
 <form id=f>
@@ -605,6 +608,18 @@ document.getElementById('f').onsubmit=async e=>{e.preventDefault();
    body:JSON.stringify({text,image_b64:img})});const j=await r.json();
   wait.textContent=j.answer||j.detail||'(…)'}catch(x){wait.textContent='실패: '+x.message}};
 t.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();document.getElementById('f').requestSubmit()}});
+
+// 바깥 보기 (몰랑이가 혼자 지금 바깥을 보고 느낀다)
+document.getElementById('look').onclick=()=>document.getElementById('lookcam').click();
+document.getElementById('lookcam').onchange=e=>{const file=e.target.files[0];if(!file)return;
+ const r=new FileReader();r.onload=async()=>{const b64=r.result.split(',')[1];
+  bubble('sys','몰랑이가 바깥을 봐요…');
+  try{const res=await fetch('/look',{method:'POST',headers:{'Content-Type':'application/json','x-key':KEY},
+    body:JSON.stringify({image_b64:b64,user_present:true})});const j=await res.json();
+   if(j.impression){bubble('mol',j.impression)}
+   else{bubble('sys',j.why||'지금은 잘 안 보였어요')}}
+  catch(x){bubble('sys','바깥 보기 실패: '+x.message)}
+  document.getElementById('lookcam').value=''};r.readAsDataURL(file)};
 
 // 알림 (아이폰: 홈 화면에 추가한 뒤에만 됨)
 function u2b(b){const p='='.repeat((4-b.length%4)%4),s=atob((b+p).replace(/-/g,'+').replace(/_/g,'/'));return Uint8Array.from([...s].map(c=>c.charCodeAt(0)))}
