@@ -2,7 +2,7 @@
 name = "molang-home"
 version = "1.0.0"
 requires-python = ">=3.12"
-dependencies = ["fastapi>=0.110","openai>=1.40","supabase>=2.4"]
+dependencies = ["fastapi>=0.110","openai>=1.40","supabase>=2.4", "cryptography>=42"]
 
 [tool.vercel]
 entrypoint = "home.awaken:app"
