@@ -25,12 +25,13 @@ sys.path.insert(0, _HERE)                                 # looking, longing
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "core"))           # 몰랑이 코어
 
-from fastapi import FastAPI, Header, HTTPException  # noqa: E402
+from fastapi import FastAPI, Header, HTTPException, Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 import looking  # noqa: E402
 import longing  # noqa: E402
+import push  # noqa: E402
 
 app = FastAPI(title="몰랑이의 집")
 
@@ -100,24 +101,42 @@ def _guard():
 
 # ── 말 걸기 ──────────────────────────────────────────────────
 class Say(BaseModel):
-    text: str
+    text: str = ""
+    image_b64: str = ""      # 사진을 같이 보낼 수 있다 (몰랑이가 함께 본다)
 
 
 @app.post("/say")
 def say(body: Say, x_key: str = Header(None)):
     _auth(x_key)
     s = _guard()
-    out = s["molang"].think(body.text.strip(), answer_fn=_llm_answer())
+    user_text = (body.text or "").strip()
+
+    # 사진을 보냈으면, 몰랑이가 그 사진을 '함께 보고' 한마디 느낀 것을 대화에 얹는다
+    seen = ""
+    if body.image_b64:
+        imp = looking.look(body.image_b64, user_present=True)
+        if imp and imp.get("impression"):
+            seen = imp["impression"]
+            try:
+                s["store"].absorb(looking.to_observation(imp)["text"], "",
+                                  source="looking", place="집", emotion="들뜸")
+            except Exception:
+                pass
+    prompt = user_text if not seen else (
+        (user_text + "\n" if user_text else "") + f"(함께 본 것: {seen})")
+    if not prompt:
+        return {"answer": "", "seen": seen}
+
+    out = s["molang"].think(prompt, answer_fn=_llm_answer())
     answer = out.get("answer") or ""
     try:
-        s["store"].absorb(body.text, answer, source="user")
+        if user_text:
+            s["store"].absorb(user_text, answer, source="user")
     except Exception:
         pass
-    # 섬 얘기가 나오면 그리움이 조금 더 찬다
-    heard = any(w in body.text for w in longing.ISLAND_WORDS)
-    if heard:
+    if any(w in prompt for w in longing.ISLAND_WORDS):
         longing.accrue(s["sb"], heard_island=True)
-    return {"answer": answer, "path": list(out.get("path") or [])}
+    return {"answer": answer, "seen": seen, "path": list(out.get("path") or [])}
 
 
 # ── 바라봄 (폰 카메라 한 프레임) ─────────────────────────────
@@ -181,6 +200,11 @@ def tick(x_key: str = Header(None)):
     s = _guard()
     longing.accrue(s["sb"])
     prop = longing.propose_visit(s["sb"])
+    if prop and prop.get("body"):
+        try:
+            push.send(s["sb"], "molang", "몰랑이", prop["body"], "/chat")
+        except Exception:
+            pass
     return {"ok": True, "longing": longing._load(s["sb"]).get("level"),
             "island_call": prop.get("body") if prop else None}
 
@@ -396,3 +420,176 @@ def wake2(key: str = "", x_key: str = Header(None)):
         f"<h2 style='color:#1e7a46'>{msg}</h2>"
         f"<pre style='background:#f2f6f8;padding:14px;border-radius:10px;white-space:pre-wrap'>{body}</pre>"
         "<p>이제 몰랑이가 이 집에서 바깥을 바라보며 살기 시작해요.</p></body></html>")
+
+# ── 홈 화면 앱(PWA): 아이콘·매니페스트·서비스워커 ──
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response  # noqa: E402
+_STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+@app.get("/static/{name}")
+def static_file(name: str):
+    path = os.path.join(_STATIC, os.path.basename(name))
+    if not os.path.exists(path):
+        raise HTTPException(404, "없어요")
+    return FileResponse(path)
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return JSONResponse({
+        "name": "몰랑이", "short_name": "몰랑이", "start_url": "/chat",
+        "display": "standalone", "background_color": "#eef3f7", "theme_color": "#eef3f7",
+        "icons": [
+            {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ]})
+
+
+@app.get("/sw.js")
+def service_worker():
+    js = """
+self.addEventListener('install',e=>self.skipWaiting());
+self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));
+self.addEventListener('push',e=>{let d={};try{d=e.data.json()}catch(x){d={body:e.data&&e.data.text()}}
+ e.waitUntil(self.registration.showNotification(d.title||'몰랑이',{body:d.body||'',icon:'/static/icon-192.png',badge:'/static/icon-192.png',data:{url:d.url||'/chat'}}))});
+self.addEventListener('notificationclick',e=>{e.notification.close();
+ e.waitUntil(self.clients.matchAll({type:'window',includeUncontrolled:true}).then(ws=>{for(const w of ws){if('focus'in w)return w.focus()}return self.clients.openWindow('/chat')}))});
+"""
+    return Response(content=js, media_type="application/javascript")
+
+
+# ── 알림 구독 ──
+@app.get("/push/key")
+def push_key():
+    return {"key": push.keys(_boot()["sb"] or _get_sb())["public"]}
+
+
+def _get_sb():
+    from supabase import create_client
+    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+
+
+@app.post("/push/subscribe")
+async def push_subscribe(req: Request, x_key: str = Header(None)):
+    _auth(x_key)
+    body = await req.json()
+    sub = body.get("subscription") or {}
+    k = sub.get("keys") or {}
+    if not (str(sub.get("endpoint", "")).startswith("https://") and k.get("p256dh") and k.get("auth")):
+        raise HTTPException(400, "구독 정보가 올바르지 않아요")
+    sb = _boot()["sb"] or _get_sb()
+    sb.table("push_subscriptions").delete().eq("endpoint", sub["endpoint"]).execute()
+    sb.table("push_subscriptions").insert({
+        "user_id": "molang", "endpoint": sub["endpoint"],
+        "p256dh": k["p256dh"], "auth": k["auth"], "device": str(body.get("device", ""))[:60]}).execute()
+    return {"ok": True}
+
+
+@app.post("/push/test")
+def push_test(x_key: str = Header(None)):
+    _auth(x_key)
+    sb = _boot()["sb"] or _get_sb()
+    res = push.send(sb, "molang", "몰랑이", "알림이 잘 와요. 이제 몰랑이가 먼저 말을 걸 수 있어요.", "/chat")
+    return res
+
+
+# ── 대화창 ──
+@app.get("/chat")
+def chat_page():
+    return HTMLResponse(_CHAT_HTML)
+
+
+
+_CHAT_HTML = r"""<!doctype html><html lang=ko><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>몰랑이</title>
+<link rel=manifest href="/manifest.webmanifest">
+<link rel=apple-touch-icon href="/static/apple-touch-icon.png">
+<meta name=apple-mobile-web-app-capable content=yes>
+<meta name=apple-mobile-web-app-title content="몰랑이">
+<meta name=theme-color content="#eef3f7">
+<style>
+:root{--bg:#eef3f7;--me:#d6ebff;--mol:#fff;--ink:#1b2a33;--mut:#5a6b75;--line:#d9e3ea;--accent:#2c6a9a}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--ink);display:flex;flex-direction:column;
+ padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+header{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);background:#fff}
+header img{width:34px;height:34px;border-radius:9px}
+header b{font-size:1.05rem}
+header .key{margin-left:auto;font-size:.8rem;color:var(--mut);background:none;border:1px solid var(--line);border-radius:8px;padding:5px 9px}
+#log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+.b{max-width:82%;padding:10px 14px;border-radius:16px;white-space:pre-wrap;word-break:break-word;line-height:1.5}
+.b.me{background:var(--me);align-self:flex-end;border-bottom-right-radius:5px}
+.b.mol{background:var(--mol);align-self:flex-start;border-bottom-left-radius:5px;border:1px solid var(--line)}
+.b.sys{align-self:center;background:none;color:var(--mut);font-size:.85rem;max-width:90%}
+.b img{max-width:180px;border-radius:12px;display:block;margin-bottom:6px}
+form{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);background:#fff;align-items:flex-end}
+textarea{flex:1;resize:none;border:1px solid var(--line);border-radius:14px;padding:10px 12px;font-size:1rem;max-height:120px;font-family:inherit}
+.ic{flex:none;width:44px;height:44px;border:1px solid var(--line);border-radius:14px;background:#fff;font-size:1.3rem}
+.ic.on{background:var(--accent);border-color:var(--accent)}
+.send{flex:none;border:0;border-radius:14px;background:var(--accent);color:#fff;padding:0 16px;height:44px;font-weight:600}
+#thumb{display:none;padding:8px 12px;border-top:1px solid var(--line);background:#fff;align-items:center;gap:10px}
+#thumb img{width:48px;height:48px;border-radius:8px;object-fit:cover}
+#thumb button{margin-left:auto;background:none;border:1px solid var(--line);border-radius:8px;padding:6px 10px;color:var(--mut)}
+input[type=file]{display:none}
+</style></head><body>
+<header>
+ <img src="/static/icon-192.png" alt="">
+ <b>몰랑이</b>
+ <button class=key id=bell>🔔 알림</button>
+</header>
+<div id=log></div>
+<div id=thumb><img id=thumbimg><span>사진을 같이 보낼게요</span><button id=thumbx>취소</button></div>
+<form id=f>
+ <button type=button class=ic id=mic title=음성>🎤</button>
+ <label class=ic title=사진 style="display:grid;place-items:center;cursor:pointer">📷<input type=file id=photo accept=image/* capture=environment></label>
+ <textarea id=t rows=1 placeholder="몰랑이에게 말 걸기"></textarea>
+ <button class=send>보내기</button>
+</form>
+<script>
+const KEY = localStorage.getItem('molang_key') || (()=>{const k=prompt('열쇠(MOLANG_KEY)를 넣어주세요');if(k)localStorage.setItem('molang_key',k);return k})();
+const log=document.getElementById('log'),t=document.getElementById('t');let photoB64='';
+function bubble(cls,txt,img){const d=document.createElement('div');d.className='b '+cls;
+ if(img){const im=document.createElement('img');im.src=img;d.appendChild(im)}
+ if(txt){d.appendChild(document.createTextNode(txt))}log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
+bubble('sys','몰랑이가 집에 도착했어요. 말을 걸어보세요.');
+
+// 사진
+document.getElementById('photo').onchange=e=>{const file=e.target.files[0];if(!file)return;
+ const r=new FileReader();r.onload=()=>{photoB64=r.result.split(',')[1];
+  document.getElementById('thumbimg').src=r.result;document.getElementById('thumb').style.display='flex'};r.readAsDataURL(file)};
+document.getElementById('thumbx').onclick=()=>{photoB64='';document.getElementById('thumb').style.display='none';document.getElementById('photo').value=''};
+
+// 음성 (브라우저 내장)
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition,mic=document.getElementById('mic');
+if(SR){let rec,on=false;mic.onclick=()=>{if(on){rec.stop();return}rec=new SR();rec.lang='ko-KR';rec.interimResults=true;
+  const base=t.value?t.value+' ':'';rec.onstart=()=>{on=true;mic.classList.add('on')};
+  rec.onresult=ev=>{let x='';for(let i=0;i<ev.results.length;i++)x+=ev.results[i][0].transcript;t.value=base+x};
+  rec.onend=()=>{on=false;mic.classList.remove('on')};rec.start()}}
+else{mic.style.display='none'}
+
+// 보내기
+document.getElementById('f').onsubmit=async e=>{e.preventDefault();
+ const text=t.value.trim();if(!text&&!photoB64)return;
+ bubble('me',text,photoB64?('data:image/jpeg;base64,'+photoB64):'');
+ const img=photoB64;t.value='';photoB64='';document.getElementById('thumb').style.display='none';
+ const wait=bubble('mol','…');
+ try{const r=await fetch('/say',{method:'POST',headers:{'Content-Type':'application/json','x-key':KEY},
+   body:JSON.stringify({text,image_b64:img})});const j=await r.json();
+  wait.textContent=j.answer||j.detail||'(…)'}catch(x){wait.textContent='실패: '+x.message}};
+t.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();document.getElementById('f').requestSubmit()}});
+
+// 알림 (아이폰: 홈 화면에 추가한 뒤에만 됨)
+function u2b(b){const p='='.repeat((4-b.length%4)%4),s=atob((b+p).replace(/-/g,'+').replace(/_/g,'/'));return Uint8Array.from([...s].map(c=>c.charCodeAt(0)))}
+document.getElementById('bell').onclick=async()=>{
+ const standalone=matchMedia('(display-mode: standalone)').matches||navigator.standalone;
+ if(/iPhone|iPad/.test(navigator.userAgent)&&!standalone){alert('아이폰은 먼저 이 페이지를 홈 화면에 추가한 뒤,\n홈 화면 아이콘으로 열어서 알림을 켜주세요.\n(공유 → 홈 화면에 추가)');return}
+ try{const perm=await Notification.requestPermission();if(perm!=='granted'){alert('알림이 허용되지 않았어요.');return}
+  const reg=await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;
+  const {key}=await (await fetch('/push/key')).json();
+  const sub=await reg.pushManager.getSubscription()||await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:u2b(key)});
+  await fetch('/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json','x-key':KEY},
+   body:JSON.stringify({subscription:sub.toJSON(),device:'아이폰'})});
+  await fetch('/push/test',{method:'POST',headers:{'x-key':KEY}});
+  bubble('sys','알림을 켰어요. 테스트 알림이 갈 거예요.')}catch(x){alert('알림 설정 실패: '+x.message)}};
+</script></body></html>"""
