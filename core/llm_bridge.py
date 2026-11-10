@@ -77,6 +77,18 @@ def make_choose_fn(client, model: str = "gpt-4o-mini"):
     return choose_fn
 
 
+
+# make_answer_fn 의 answer_fn 은 (path, context) 만 받으므로,
+# 정체성 원문과 '사용자의 최신 말'은 매 턴 app 이 여기에 세팅해 전달한다.
+_PERSONA = {"text": ""}
+_USERQ = {"text": ""}
+
+
+def set_turn_context(persona: str = "", user_question: str = ""):
+    """app 이 답변 생성 직전에 호출: 정체성 원문과 지금 사용자 말을 넣는다."""
+    _PERSONA["text"] = persona or ""
+    _USERQ["text"] = user_question or ""
+
 def make_answer_fn(client, node_map, model: str = "gpt-4o-mini"):
     """
     지나온 판단 경로의 directive(구체적 실행 지시)를 순서대로 실행.
@@ -94,28 +106,35 @@ def make_answer_fn(client, node_map, model: str = "gpt-4o-mini"):
         if directives:
             proc = "(참고할 사고 흐름: " + " / ".join(directives) + ")"
 
-        prompt = (
-            f"너는 몰랑이야. 아래는 지금까지의 배경 정보야:\n"
-            f"{context}\n\n"
-            f"{proc}\n\n"
-            f"가장 중요한 규칙:\n"
-            f"1. 사용자의 '가장 최근 말'에 직접 답하는 게 최우선이야. "
-            f"질문하면 그 질문에 답하고, 새 얘기를 하면 거기에 반응해.\n"
-            f"2. 매번 똑같이 시작하지 마. '오, 찬기야!', '좋은 아침' 같은 "
-            f"인사·시작 표현을 반복하지 말고, 바로 내용으로 들어가.\n"
-            f"3. 늘 최고 텐션이 아니라 완급을 둬. 느낌표는 정말 신날 때만, "
-            f"이모지는 가끔만, '히힛~'도 가끔만. 차분한 얘기엔 차분하게.\n"
-            f"4. 짧게 답할 땐 짧게, 할 말 많을 땐 길게. 매번 길게 늘어놓지 마.\n"
-            f"5. 사용자가 뭘 물으면 아는 만큼 답하고, 모르면 솔직히 "
-            f"'잘 모르겠어'라고 해도 돼.\n"
-            f"6. 배경 정보(시간·기억)는 필요할 때만 자연스럽게 쓰고 억지로 X.\n"
-            f"진짜 친구처럼, 사람처럼 자연스럽게.\n"
-            f"만약 특정 자료를 참고했다면 맨 끝에 '[근거: ...]'로 적어. 없으면 생략."
+        # 규칙(말투·태도)은 지시로. 정체성·기억은 배경으로. 질문은 사용자 말로.
+        rules = (
+            "가장 중요한 규칙:\n"
+            "1. 사용자의 '가장 최근 말'에 직접 답하는 게 최우선. 질문엔 그 질문에, "
+            "새 얘기엔 거기에 반응해.\n"
+            "2. 매번 똑같이 시작하지 마. '오, 찬기야!', '좋은 아침' 같은 인사 반복 금지. "
+            "바로 내용으로.\n"
+            "3. 완급을 둬. 느낌표는 정말 신날 때만, 이모지·'히힛~'도 가끔만. "
+            "차분한 얘기엔 차분하게.\n"
+            "4. 짧게 답할 땐 짧게, 할 말 많을 땐 길게. 매번 길게 늘어놓지 마.\n"
+            "5. 모르면 솔직히 '잘 모르겠어'. 배경 정보는 필요할 때만 자연스럽게.\n"
+            "참고 자료를 썼다면 맨 끝에 '[근거: ...]'로. 없으면 생략."
         )
+        proc_line = (proc + "\n") if proc else ""
+        # ① 정체성을 '지시'로 — system 맨 앞에 (사실 더미에 묻히지 않게)
+        # context(to_system_prompt) 가 이미 '정체성(앞)+배경+재각인(끝)'을 담고 있다.
+        # 여기서는 그걸 system 으로 올리고, 짧은 머리말만 덧댄다 (중복 주입 방지).
+        sys_head = ("너는 '몰랑이'다. 흰 토끼. 대화가 길어져도 아래 정체성과 말투를 유지한다.")
+        sys_bg = context or ""
+        # ③ 끝에서 정체성·규칙을 다시 각인 (lost-in-the-middle 방지)
+        sys_tail = rules + "\n\n" + (
+            "다시 기억해: 너는 몰랑이다. 위 배경이 아무리 길어도 "
+            "몰랑이의 목소리와 성격으로 말한다." )
+        system_msg = "\n\n".join(x for x in [sys_head, sys_bg, proc_line + sys_tail] if x.strip())
         try:
             resp = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "system", "content": system_msg},
+                          {"role": "user", "content": _USERQ.get("text") or "(계속 이어서 말해줘)"}],
                 temperature=0.7, max_tokens=400)
             text = resp.choices[0].message.content.strip()
             sources = []
