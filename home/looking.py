@@ -46,14 +46,14 @@ def can_look(now: float | None = None) -> bool:
     return now - _last_look["at"] >= LOOK_COOLDOWN_SEC
 
 
-def look(frame_b64: str, user_present: bool, now: float | None = None) -> dict | None:
+def look(frame_b64: str, user_present: bool, now: float | None = None, force: bool = False) -> dict | None:
     """
     폰이 보낸 카메라 한 프레임(base64 jpeg)을 '한 장면의 인상'으로 바꾼다.
     너무 이르면 None (바라봄은 드물게).
     돌려주는 값: {"impression": "...", "with_user": bool, "at": ts}
     """
     now = now or time.time()
-    if not can_look(now):
+    if not force and not can_look(now):
         return None
     try:
         client = _vision_client()
