@@ -478,7 +478,17 @@ self.addEventListener('notificationclick',e=>{e.notification.close();
 # ── 알림 구독 ──
 @app.get("/push/key")
 def push_key():
-    return {"key": _push().keys(_boot()["sb"] or _get_sb())["public"]}
+    try:
+        import cryptography  # noqa: F401
+    except Exception:
+        raise HTTPException(500, "알림 라이브러리(cryptography)가 아직 안 깔렸어요. "
+                                 "requirements.txt 에 cryptography>=42 를 넣고 재배포하세요.")
+    try:
+        sb = _boot()["sb"] or _get_sb()
+        return {"key": _push().keys(sb)["public"]}
+    except Exception as e:
+        raise HTTPException(500, f"알림 열쇠 생성 실패: {str(e)[:150]} "
+                                 "(app_secrets 테이블이 없으면 00_schema.sql 을 다시 실행하세요)")
 
 
 def _get_sb():
@@ -603,8 +613,9 @@ document.getElementById('bell').onclick=async()=>{
  if(/iPhone|iPad/.test(navigator.userAgent)&&!standalone){alert('아이폰은 먼저 이 페이지를 홈 화면에 추가한 뒤,\n홈 화면 아이콘으로 열어서 알림을 켜주세요.\n(공유 → 홈 화면에 추가)');return}
  try{const perm=await Notification.requestPermission();if(perm!=='granted'){alert('알림이 허용되지 않았어요.');return}
   const reg=await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;
-  const {key}=await (await fetch('/push/key')).json();
-  const sub=await reg.pushManager.getSubscription()||await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:u2b(key)});
+  const kr=await fetch('/push/key');const kj=await kr.json();
+  if(!kr.ok||!kj.key){alert('알림 준비 실패: '+(kj.detail||'열쇠를 못 받았어요'));return}
+  const sub=await reg.pushManager.getSubscription()||await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:u2b(kj.key)});
   await fetch('/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json','x-key':KEY},
    body:JSON.stringify({subscription:sub.toJSON(),device:'아이폰'})});
   await fetch('/push/test',{method:'POST',headers:{'x-key':KEY}});
